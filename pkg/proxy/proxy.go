@@ -13,6 +13,7 @@ import (
 	mathrand "math/rand"
 	"net"
 	neturl "net/url"
+	"os"
 	"runtime"
 	"sort"
 	"strings"
@@ -261,9 +262,12 @@ type Proxy struct {
 	wrapAProv     atomic.Pointer[WrapAProvision]
 	wrapAProvCh   chan struct{}
 
-	wg sync.WaitGroup
+	wg           sync.WaitGroup
+	workerMu     sync.Mutex
+	shuttingDown bool
 
-	started atomic.Bool
+	started       atomic.Bool
+	terminalError atomic.Value
 
 	// Active session context (cancelled on Pause, recreated on Resume)
 	sessMu     sync.Mutex
@@ -678,18 +682,31 @@ func (p *Proxy) signalBootstrapDone(err error) {
 // same signal — the channel value is replayed back so later waiters get it
 // too. Returns nil on ready, an error otherwise.
 func (p *Proxy) WaitBootstrap(timeout time.Duration) error {
-	select {
-	case err := <-p.bootstrapDoneCh:
-		// Replay the signal so any future waiter also observes it.
+	deadline := time.NewTimer(timeout)
+	defer deadline.Stop()
+	ticker := time.NewTicker(250 * time.Millisecond)
+	defer ticker.Stop()
+	for {
 		select {
-		case p.bootstrapDoneCh <- err:
-		default:
+		case err := <-p.bootstrapDoneCh:
+			// Replay the signal so any future waiter also observes it.
+			select {
+			case p.bootstrapDoneCh <- err:
+			default:
+			}
+			return err
+		case <-deadline.C:
+			return fmt.Errorf("bootstrap timeout after %s", timeout)
+		case <-ticker.C:
+			if runtime.GOOS == "android" && p.GetStats().CaptchaImageURL != "" {
+				return errors.New("VK requires captcha: manual browser action is required; this test client cannot complete interactive VK captcha")
+			}
+		case <-p.ctx.Done():
+			if terminal := p.TerminalError(); terminal != "" {
+				return errors.New(terminal)
+			}
+			return p.ctx.Err()
 		}
-		return err
-	case <-time.After(timeout):
-		return fmt.Errorf("bootstrap timeout after %s", timeout)
-	case <-p.ctx.Done():
-		return p.ctx.Err()
 	}
 }
 
@@ -698,7 +715,26 @@ func (p *Proxy) WaitBootstrap(timeout time.Duration) error {
 // Idempotent: subsequent calls after a successful start return nil without
 // re-initializing. This lets turnbind.Open() safely call Start() even when
 // the caller has already started the proxy via wgStartVKBootstrap.
+func (p *Proxy) StartAsync() {
+	p.startWorker(func() { _ = p.Start() })
+}
+
+func (p *Proxy) startWorker(worker func()) {
+	p.workerMu.Lock()
+	if p.shuttingDown {
+		p.workerMu.Unlock()
+		return
+	}
+	p.wg.Add(1)
+	p.workerMu.Unlock()
+	go func() { defer p.wg.Done(); worker() }()
+}
+
 func (p *Proxy) Start() error {
+	if err := p.ctx.Err(); err != nil {
+		p.signalBootstrapDone(err)
+		return err
+	}
 	if p.started.Swap(true) {
 		return nil
 	}
@@ -707,25 +743,31 @@ func (p *Proxy) Start() error {
 	// iOS Network Extensions are killed if they exceed 45000 wakeups/300s.
 	// With 10 connections and ~50 goroutines, unrestricted GOMAXPROCS
 	// causes ~1500 wakes/sec. Limiting to 2 threads keeps us well under.
-	runtime.GOMAXPROCS(2)
+	if runtime.GOOS == "darwin" {
+		runtime.GOMAXPROCS(2)
+	}
 
 	// p.linkID is fixed in NewProxy (parseVKLinkID) and never written here:
 	// RefreshCaptchaURL reads it on Swift's thread with no ordering against
 	// this goroutine, so it must be immutable once the Proxy exists.
 
 	// Resolve peer address
-	peer, err := net.ResolveUDPAddr("udp", p.config.PeerAddr)
+	peer, err := resolvePhysicalUDP(p.ctx, p.config.PeerAddr)
 	if err != nil {
 		wrapped := fmt.Errorf("resolve peer: %w", err)
 		p.signalBootstrapDone(wrapped)
 		return wrapped
 	}
 	p.peer = peer
+	if err := p.ctx.Err(); err != nil {
+		p.signalBootstrapDone(err)
+		return err
+	}
 
 	// Start watchdog goroutine to detect dead tunnels after iOS freeze/thaw.
 	// This is the primary self-healing mechanism — it doesn't rely on iOS
 	// calling sleep()/wake() which is unreliable.
-	go p.runWatchdog()
+	p.startWorker(p.runWatchdog)
 
 	// Diagnostic heartbeat — fires every 5s for the first 2 minutes after
 	// proxy.Start. Logs goroutine count + RSS + per-channel pending depth
@@ -737,21 +779,21 @@ func (p *Proxy) Start() error {
 	//
 	// Time-bounded so a long-lived production session doesn't accumulate
 	// thousands of heartbeat lines. Investigating build-119 38s-death.
-	go p.runDiagnosticHeartbeat(p.ctx, 2*time.Minute, 5*time.Second)
+	p.startWorker(func() { p.runDiagnosticHeartbeat(p.ctx, 2*time.Minute, 5*time.Second) })
 
 	// Background cred-pool grower: fills empty slots over time without
 	// blocking conn startup. Conn 0 still does an inline fetch (needs at
 	// least one cred to bootstrap). Conns 1-N use fallback to whichever
 	// slots are fresh; the grower backfills pool[1..N-1] slowly so the
 	// pool eventually reaches full insurance coverage.
-	go p.growCredPool(p.ctx)
+	p.startWorker(func() { p.growCredPool(p.ctx) })
 
 	// Per-conn byte-counter dump goroutine. Runs every 60s and emits a
 	// log block listing each conn's TX/RX delta + cumulative. Purely
 	// diagnostic — used to investigate per-conn throughput asymmetry
 	// (e.g. when total speedtest result drops but mechanism unclear).
 	// See logConnStatsTick comment for output format.
-	go p.logConnStatsLoop(p.ctx)
+	p.startWorker(func() { p.logConnStatsLoop(p.ctx) })
 
 	// Memory-stats dump goroutine. Runs every 60s and emits one line
 	// from runtime.MemStats — Sys (what iOS jetsam looks at), heap
@@ -763,7 +805,7 @@ func (p *Proxy) Start() error {
 	// Linear growth in Sys identifies a leak; flat-but-high Sys says
 	// the limit is structurally tight at NumConns=50 and we should
 	// consider proactive self-restart or a smaller pool.
-	go p.logMemStatsLoop(p.ctx)
+	p.startWorker(func() { p.logMemStatsLoop(p.ctx) })
 
 	// Path-stats dump goroutine. Runs every 60s and emits one line
 	// reporting (a) the OS default-route source IP right now, sampled
@@ -776,12 +818,12 @@ func (p *Proxy) Start() error {
 	// that the conns were already on a doomed source IP. The level-
 	// triggered snapshot complements the existing edge-triggered
 	// [PathMonitor] log lines.
-	go p.logPathStatsLoop(p.ctx)
+	p.startWorker(func() { p.logPathStatsLoop(p.ctx) })
 
 	// Paced synthetic uplink — returns immediately unless UplinkSynthMbit is
 	// set, in which case it waits for the pool and runs once. Diagnostic only;
 	// see synth.go.
-	go p.runUplinkSynthLoop(p.ctx)
+	p.startWorker(func() { p.runUplinkSynthLoop(p.ctx) })
 
 	err = p.startConnections()
 	if err != nil {
@@ -1069,7 +1111,7 @@ func (p *Proxy) startConnections() error {
 			// Only spawn one waiter at a time — multiple goroutines
 			// competing on captchaCh cause missed answers and orphaned waiters.
 			if p.captchaWaiterActive.CompareAndSwap(false, true) {
-				go p.waitCaptchaAndRestart()
+				p.startWorker(p.waitCaptchaAndRestart)
 			} else {
 				log.Printf("proxy: waitCaptchaAndRestart already running, not spawning another")
 			}
@@ -1226,7 +1268,7 @@ func (p *Proxy) Resume() {
 	// Invalidate creds — after sleep, TURN allocations expired
 	p.credPool.invalidate()
 	log.Printf("proxy: Resume — cancelled old session, starting fresh connections")
-	go p.startConnections()
+	p.startWorker(func() { _ = p.startConnections() })
 }
 
 // ForceReconnect tears down all connections and starts fresh.
@@ -1271,7 +1313,7 @@ func (p *Proxy) ForceReconnect() {
 	p.lastRecvTime.Store(time.Now().Unix())
 	p.reconnects.Add(1)
 	log.Printf("proxy: ForceReconnect — watchdog triggered, starting fresh connections")
-	go p.startConnections()
+	p.startWorker(func() { _ = p.startConnections() })
 }
 
 // WakeHealthCheck is called from Swift wake() whenever iOS resumes the
@@ -1619,6 +1661,24 @@ func notePeak(mark *atomic.Int64, depth int) {
 
 // SendPacket sends a WireGuard packet through the tunnel.
 func (p *Proxy) SendPacket(data []byte) error {
+	return p.SendPacketUntil(nil, data)
+}
+
+// SendPacketUntil allows a closing WireGuard bind to cancel a blocked enqueue
+// without stopping the shared TURN session. A nil done preserves SendPacket.
+func (p *Proxy) SendPacketUntil(done <-chan struct{}, data []byte) error {
+	return p.SendPacketUntilDeadline(done, data, time.Time{})
+}
+
+func (p *Proxy) SendPacketUntilDeadline(done <-chan struct{}, data []byte, deadline time.Time) error {
+	if !deadline.IsZero() && !time.Now().Before(deadline) {
+		return os.ErrDeadlineExceeded
+	}
+	select {
+	case <-done:
+		return net.ErrClosed
+	default:
+	}
 	// 🚨 THE COPY STAYS, and pooling is exactly why it must. Both producers
 	// REUSE their argument: synth.go re-sends one mutated buffer per burst and
 	// turnbind/bind.go passes wireguard-go's staged buffers, reclaimed the
@@ -1652,7 +1712,21 @@ func (p *Proxy) SendPacket(data []byte) error {
 		return nil
 	default:
 	}
+
+	// BindUpdate takes WireGuard's network lock before it closes the old bind.
+	// Bound waits even while done is open so it can obtain that lock.
+	var timeout <-chan time.Time
+	if done != nil || !deadline.IsZero() {
+		budget := time.Second
+		if !deadline.IsZero() && time.Until(deadline) < budget {
+			budget = time.Until(deadline)
+		}
+		timer := time.NewTimer(budget)
+		defer timer.Stop()
+		timeout = timer.C
+	}
 	start := time.Now()
+	var err error
 	select {
 	case p.sendCh <- item:
 		p.sendChBlockNs.Add(int64(time.Since(start)))
@@ -1661,14 +1735,19 @@ func (p *Proxy) SendPacket(data []byte) error {
 		p.txBytes.Add(int64(len(data)))
 		p.txPackets.Add(1)
 		return nil
+	case <-timeout:
+		err = os.ErrDeadlineExceeded
+	case <-done:
+		err = net.ErrClosed
 	case <-p.ctx.Done():
-		// Ownership: until the send succeeds the buffer is still ours, and this
-		// is the ONLY exit that never reaches the channel. Every other exit is
-		// a successful enqueue, after which sendCh owns it and writePacket
-		// returns it — see the ownership note on sendPktPool.
-		sendPktPoolPut(buf)
-		return p.ctx.Err()
+		err = p.ctx.Err()
 	}
+	// Ownership: until the send succeeds the buffer is still ours, and this
+	// is the ONLY exit that never reaches the channel. Every other exit is
+	// a successful enqueue, after which sendCh owns it and writePacket
+	// returns it — see the ownership note on sendPktPool.
+	sendPktPoolPut(buf)
+	return err
 }
 
 // enqueueRecv hands a received packet to ReceivePacket, measuring how long the
@@ -1982,7 +2061,10 @@ func (p *Proxy) TURNServerIP() string {
 // stopTunnel doesn't return within ~26s, losing log buffers in the
 // process; bounding the wait avoids that path.
 func (p *Proxy) Stop() {
+	p.workerMu.Lock()
+	p.shuttingDown = true
 	p.cancel()
+	p.workerMu.Unlock()
 	p.wg.Wait()
 }
 
@@ -2002,7 +2084,10 @@ func (p *Proxy) Stopped() bool {
 // the leftover goroutines die when the Go runtime terminates moments
 // later as iOS reaps the extension process.
 func (p *Proxy) StopWithTimeout(timeout time.Duration) {
+	p.workerMu.Lock()
+	p.shuttingDown = true
 	p.cancel()
+	p.workerMu.Unlock()
 	done := make(chan struct{})
 	go func() {
 		p.wg.Wait()
@@ -3159,9 +3244,15 @@ func (p *Proxy) runWrapASession(sessCtx context.Context, linkID string, readyCh 
 	// isn't eaten by the WireGuard read goroutine.
 	prov, err := doGetconf(dtlsConn, p.config.DeviceID, p.config.WrapAPassword)
 	if err != nil {
+		if strings.Contains(err.Error(), "getconf: denied:") || strings.Contains(err.Error(), "NOCONF") {
+			p.terminalError.Store(err.Error())
+			p.cancel()
+		}
 		return fmt.Errorf("WRAP-A getconf: %w", err)
 	}
-	p.storeWrapAProvision(prov)
+	if err := p.storeWrapAProvision(prov); err != nil {
+		return err
+	}
 
 	p.dtlsHSns.Store(int64(time.Since(dtlsStart)))
 	p.activeConns.Add(1)
@@ -3340,7 +3431,7 @@ func dialDTLSWrapA(ctx context.Context, transport net.PacketConn, peer *net.UDPA
 // storeWrapAProvision records the server-minted WireGuard config exactly once
 // (the first runWrapASession to finish GETCONF) and wakes any
 // WaitWrapAProvision callers by closing wrapAProvCh.
-func (p *Proxy) storeWrapAProvision(prov *WrapAProvision) {
+func (p *Proxy) storeWrapAProvision(prov *WrapAProvision) error {
 	p.wrapAProvOnce.Do(func() {
 		p.wrapAProv.Store(prov)
 		if p.wrapAProvCh != nil {
@@ -3349,6 +3440,19 @@ func (p *Proxy) storeWrapAProvision(prov *WrapAProvision) {
 		log.Printf("proxy: WRAP-A provisioned: addr=%s dns=%s mtu=%d keepalive=%d",
 			prov.Address, prov.DNS, prov.MTU, prov.KeepaliveSec)
 	})
+	if first := p.wrapAProv.Load(); first == nil || *first != *prov {
+		p.terminalError.Store("getconf: inconsistent WireGuard provision across TURN connections")
+		p.cancel()
+		return errors.New("getconf: inconsistent WireGuard provision across TURN connections")
+	}
+	return nil
+}
+
+func (p *Proxy) TerminalError() string {
+	if value := p.terminalError.Load(); value != nil {
+		return value.(string)
+	}
+	return ""
 }
 
 // WaitWrapAProvision blocks until WRAP-A GETCONF provisioning has produced the
@@ -3391,7 +3495,7 @@ func addrFamilyFor(peer *net.UDPAddr) turn.RequestedAddressFamily {
 // the pion/turn client handles allocation refresh automatically.
 // conn2's deadline is reset before returning so it can be reused.
 func (p *Proxy) runTURN(ctx context.Context, turnAddr string, creds *TURNCreds, conn2 net.PacketConn, connIdx int, slotIdx int, gave *gaveBack) error {
-	turnUDPAddr, err := net.ResolveUDPAddr("udp", turnAddr)
+	turnUDPAddr, err := resolvePhysicalUDP(ctx, turnAddr)
 	if err != nil {
 		return fmt.Errorf("resolve TURN: %w", err)
 	}
@@ -3399,7 +3503,7 @@ func (p *Proxy) runTURN(ctx context.Context, turnAddr string, creds *TURNCreds, 
 	// Connect to TURN server
 	var turnConn net.PacketConn
 	if p.config.UseUDP {
-		udpConn, err := net.DialUDP("udp", nil, turnUDPAddr)
+		udpConn, err := dialPhysical(ctx, "udp4", turnUDPAddr.String(), 5*time.Second)
 		if err != nil {
 			return fmt.Errorf("dial TURN UDP: %w", err)
 		}
@@ -3408,8 +3512,7 @@ func (p *Proxy) runTURN(ctx context.Context, turnAddr string, creds *TURNCreds, 
 	} else {
 		tcpCtx, tcpCancel := context.WithTimeout(ctx, 5*time.Second)
 		defer tcpCancel()
-		var d net.Dialer
-		tcpConn, err := d.DialContext(tcpCtx, "tcp", turnAddr)
+		tcpConn, err := dialPhysical(tcpCtx, "tcp4", turnAddr, 5*time.Second)
 		if err != nil {
 			return fmt.Errorf("dial TURN TCP: %w", err)
 		}
@@ -4335,7 +4438,7 @@ func (p *Proxy) logMemStatsLoop(ctx context.Context) {
 // Returns "n/a" if no usable network is up at all (rare on iOS where
 // there's almost always at least cellular).
 func pathSnapshotOSDefault() string {
-	conn, err := net.Dial("udp", "1.1.1.1:53")
+	conn, err := dialPhysical(context.Background(), "udp4", "1.1.1.1:53", time.Second)
 	if err != nil {
 		return "n/a"
 	}
@@ -4548,7 +4651,12 @@ func dialDTLS(ctx context.Context, transport net.PacketConn, peer *net.UDPAddr) 
 }
 
 type connectedUDPConn struct {
-	*net.UDPConn
+	net.Conn
+}
+
+func (c *connectedUDPConn) ReadFrom(p []byte) (int, net.Addr, error) {
+	n, err := c.Conn.Read(p)
+	return n, c.Conn.RemoteAddr(), err
 }
 
 func (c *connectedUDPConn) WriteTo(p []byte, _ net.Addr) (int, error) {
@@ -5537,14 +5645,13 @@ func (p *Proxy) setupSRTPSession(ctx context.Context, turnAddr string, creds *TU
 	// transport plumbing.
 	var ctlConn net.PacketConn
 	if p.config.UseUDP {
-		uc, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4zero, Port: 0})
+		uc, err := dialPhysical(ctx, "udp4", turnAddr, 5*time.Second)
 		if err != nil {
 			return nil, fmt.Errorf("local udp listen: %w", err)
 		}
-		ctlConn = uc
+		ctlConn = &connectedUDPConn{uc}
 	} else {
-		dialer := net.Dialer{Timeout: 5 * time.Second}
-		tcp, err := dialer.Dial("tcp", turnAddr)
+		tcp, err := dialPhysical(ctx, "tcp4", turnAddr, 5*time.Second)
 		if err != nil {
 			return nil, fmt.Errorf("dial tcp to relay: %w", err)
 		}

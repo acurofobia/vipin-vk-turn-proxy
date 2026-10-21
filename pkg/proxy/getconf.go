@@ -30,6 +30,8 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/netip"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -92,6 +94,9 @@ func doGetconf(conn net.Conn, deviceID, password string) (*WrapAProvision, error
 	if password == "" {
 		return nil, errors.New("getconf: empty password")
 	}
+	if strings.ContainsAny(deviceID+password, "\r\n\x00|") {
+		return nil, errors.New("getconf: invalid control field")
+	}
 
 	req := fmt.Sprintf("GETCONF:%s|%s|%s", wrapAGetconfPort, deviceID, password)
 	_ = conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
@@ -120,7 +125,7 @@ func doGetconf(conn net.Conn, deviceID, password string) (*WrapAProvision, error
 
 	prov, err := parseWGINIToProvision(resp)
 	if err != nil {
-		return nil, fmt.Errorf("getconf: %w (resp %q)", err, truncate(resp, 120))
+		return nil, fmt.Errorf("getconf: invalid server provision: %w", err)
 	}
 	return prov, nil
 }
@@ -148,12 +153,16 @@ func parseWGINIToProvision(ini string) (*WrapAProvision, error) {
 		case "DNS":
 			wp.DNS = strings.TrimSpace(strings.Split(v, ",")[0])
 		case "MTU":
-			if _, err := fmt.Sscanf(v, "%d", &wp.MTU); err != nil || wp.MTU <= 0 {
-				wp.MTU = 1280
+			var err error
+			wp.MTU, err = strconv.Atoi(v)
+			if err != nil {
+				return nil, errors.New("invalid provision MTU")
 			}
 		case "PersistentKeepalive":
-			if _, err := fmt.Sscanf(v, "%d", &wp.KeepaliveSec); err != nil || wp.KeepaliveSec <= 0 {
-				wp.KeepaliveSec = 25
+			var err error
+			wp.KeepaliveSec, err = strconv.Atoi(v)
+			if err != nil {
+				return nil, errors.New("invalid provision keepalive")
 			}
 		}
 	}
@@ -166,6 +175,16 @@ func parseWGINIToProvision(ini string) (*WrapAProvision, error) {
 	}
 	if wp.PeerPublicKeyHex, err = keyB64toHex(pubB64); err != nil {
 		return nil, fmt.Errorf("PublicKey: %w", err)
+	}
+	address, err := netip.ParsePrefix(wp.Address)
+	if err != nil || !address.Addr().Is4() || address.Addr().IsUnspecified() || address.Addr().IsMulticast() {
+		return nil, errors.New("invalid IPv4 tunnel CIDR")
+	}
+	if wp.MTU < 1280 || wp.MTU > 1500 {
+		return nil, errors.New("provision MTU must be 1280...1500")
+	}
+	if wp.KeepaliveSec < 1 || wp.KeepaliveSec > 300 {
+		return nil, errors.New("invalid provision keepalive interval")
 	}
 	return wp, nil
 }

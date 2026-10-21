@@ -53,9 +53,9 @@ var captchaPowProfile BrowserProfile
 // string. Both go directly into our outgoing componentDone/check
 // requests without re-encoding.
 type VKBrowserProfile struct {
-	Device    string  `json:"device"`
-	BrowserFp string  `json:"browser_fp"`
-	UserAgent string  `json:"user_agent"`
+	Device    string `json:"device"`
+	BrowserFp string `json:"browser_fp"`
+	UserAgent string `json:"user_agent"`
 	// CapturedAt is unix seconds with sub-second fraction. Stored as
 	// float64 because Swift writes TimeInterval (Double) and Go's
 	// json.Unmarshal won't coerce a float into int64. Match Swift's
@@ -263,21 +263,21 @@ func applyChromeHints(req *fhttp.Request) {
 // built-in profile (v1.14.0) has three concrete divergences from real
 // Safari iOS 26 that we observed on wire:
 //
-//   1. CipherSuites: 21 vs 16. Real Safari iOS 26 sends NO 3DES suites
-//      (Apple removed years ago); bogdanfinn includes TLS_..._3DES_EDE_CBC_SHA.
-//      Order also differs: real Safari = AES_128_GCM first, bogdanfinn =
-//      AES_256_GCM first.
+//  1. CipherSuites: 21 vs 16. Real Safari iOS 26 sends NO 3DES suites
+//     (Apple removed years ago); bogdanfinn includes TLS_..._3DES_EDE_CBC_SHA.
+//     Order also differs: real Safari = AES_128_GCM first, bogdanfinn =
+//     AES_256_GCM first.
 //
-//   2. SupportedCurves: 5 vs 4. Bogdanfinn adds CurveP521 (secp521r1);
-//      real Safari doesn't have it.
+//  2. SupportedCurves: 5 vs 4. Bogdanfinn adds CurveP521 (secp521r1);
+//     real Safari doesn't have it.
 //
-//   3. Extension order: FIXED in bogdanfinn (same JA3 across all
-//      connections); RANDOMIZED in real Safari (different JA3 every
-//      connection due to GREASE + per-connection shuffle).
+//  3. Extension order: FIXED in bogdanfinn (same JA3 across all
+//     connections); RANDOMIZED in real Safari (different JA3 every
+//     connection due to GREASE + per-connection shuffle).
 //
-//   4. Missing extensions: bogdanfinn lacks encrypted_client_hello
-//      (65037), application_settings (17613 ALPS), session_ticket (35).
-//      Real Safari iOS 17+ sends all three.
+//  4. Missing extensions: bogdanfinn lacks encrypted_client_hello
+//     (65037), application_settings (17613 ALPS), session_ticket (35).
+//     Real Safari iOS 17+ sends all three.
 //
 // VK detection likely catches all of these — most damning is #3: 24
 // consecutive Go-solver connections with identical JA3 vs Safari rotating
@@ -310,12 +310,13 @@ func applyChromeHints(req *fhttp.Request) {
 // this device.
 //
 // Reference: extension order from pcap WebView ClientHello:
-//   GREASE, server_name (0), extended_master_secret (23),
-//   renegotiation_info (65281), supported_groups (10),
-//   ec_point_formats (11), ALPN (16), status_request (5),
-//   signature_algorithms (13), signed_certificate_timestamp (18),
-//   key_share (51), psk_key_exchange_modes (45),
-//   supported_versions (43), compress_certificate (27), GREASE
+//
+//	GREASE, server_name (0), extended_master_secret (23),
+//	renegotiation_info (65281), supported_groups (10),
+//	ec_point_formats (11), ALPN (16), status_request (5),
+//	signature_algorithms (13), signed_certificate_timestamp (18),
+//	key_share (51), psk_key_exchange_modes (45),
+//	supported_versions (43), compress_certificate (27), GREASE
 //
 // If Phase 9 still triggers BOT on VK while WebView solve succeeds on
 // the same IP within the same minute, detection is provably NOT at
@@ -542,9 +543,9 @@ type sessionClientHolder struct {
 // set; newDirectDialer overwrites Timeout with the client's WithTimeoutSeconds.
 func vkDiagDialer() net.Dialer {
 	return net.Dialer{
-		Control: func(network, address string, _ syscall.RawConn) error {
+		Control: func(network, address string, raw syscall.RawConn) error {
 			log.Printf("vk-dial: requesting %s %s", network, address)
-			return nil
+			return socketControl(network, address, raw)
 		},
 	}
 }
@@ -598,7 +599,8 @@ func newVKSessionClient(jar fhttp.CookieJar) (tls_client.HttpClient, error) {
 		tls_client.WithTimeoutSeconds(20),
 		tls_client.WithClientProfile(clientProfile),
 		tls_client.WithCookieJar(jar),
-		tls_client.WithDialer(vkDiagDialer()), // DIAGNOSTIC (build 167): log requested dial addr+family
+		tls_client.WithDialer(vkDiagDialer()),
+		physicalTLSClientOption(),
 	}
 	if vkSessionClientExtraOptions != nil {
 		options = append(options, vkSessionClientExtraOptions()...)
@@ -723,7 +725,8 @@ func newFreshSessionClient() tls_client.HttpClient {
 		tls_client.WithTimeoutSeconds(20),
 		tls_client.WithClientProfile(clientProfile),
 		tls_client.WithCookieJar(tls_client.NewCookieJar()),
-		tls_client.WithDialer(vkDiagDialer()), // DIAGNOSTIC (build 167): log requested dial addr+family
+		tls_client.WithDialer(vkDiagDialer()),
+		physicalTLSClientOption(),
 	)
 	if cerr != nil {
 		log.Printf("pow: ERROR creating fresh session client: %v — falling back to singleton", cerr)
@@ -1127,7 +1130,6 @@ func fetchPoW(ctx context.Context, client tls_client.HttpClient, redirectURI str
 
 	return params, scriptURL, htmlSettings, nil
 }
-
 
 // solvePoW brute-forces SHA-256(powInput + nonce) until the hash
 // starts with `difficulty` leading zeros. Returns the hex digest and the
@@ -1680,7 +1682,7 @@ func callCaptchaNotRobotAPI(ctx context.Context, client tls_client.HttpClient, s
 				httpResp.Header.Get("Content-Encoding"), err)
 		}
 
-		log.Printf("pow: %s response: %s", method, string(body[:min(300, len(body))]))
+		log.Printf("pow: %s response received (%d bytes)", method, len(body))
 
 		var resp map[string]interface{}
 		if err := json.Unmarshal(body, &resp); err != nil {

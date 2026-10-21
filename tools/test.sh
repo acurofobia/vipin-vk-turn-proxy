@@ -1,98 +1,32 @@
 #!/usr/bin/env bash
-# Run EVERY test suite in this repository.
-#
-#   ./tools/test.sh
-#
-# 🚨 WHY THIS FILE EXISTS. The suites live in three places that no single command
-# reaches:
-#
-#   1. pkg/... and the rest of the root module   — `go test ./...`
-#   2. third_party/speedtest-go                  — a SEPARATE module behind a
-#      `replace`, so the root `./...` does not see it. Its fork guards had never
-#      been run by anything except a human typing the command.
-#   3. tools/swiftcheck                          — a compiled Swift harness.
-#
-# Recording three commands in three files is the same defect as a harness that is
-# green, sabotage-validated and not in the repo: a recorded way to run something
-# that does not run. One entry point, and it is the one release.sh calls.
+# Run the Go suites retained in the Android source subset.
 set -uo pipefail
 cd "$(dirname "$0")/.."
 
 RACE=${RACE:-1}
 fail=0
 run() {
-    echo
-    echo "══ $1"
+    printf '\n%s\n' "$1"
     shift
-    if "$@"; then
-        echo "   PASS"
-    else
-        echo "   FAIL"
+    if ! "$@"; then
         fail=1
     fi
 }
 
 goflags=(-count=1)
-[ "$RACE" = "1" ] && goflags+=(-race)
+[[ "$RACE" == "1" ]] && goflags+=(-race)
 
-# 🚨 THE GATE RUNS THE SLOW TESTS TOO. A test that waits for a library's own
-# timer (pion refreshes a permission every 120 s) skips itself unless VKTP_SLOW is
-# set, so that a bare `go test` stays quick -- and a test that only a human or a
-# sabotage runner ever switches on is a test the gate cannot see. It costs this
-# script about two minutes. VKTP_SLOW= ./tools/test.sh leaves them out.
+# Include the permission-refresh tests in the full gate. Set VKTP_SLOW=
+# explicitly to omit tests that wait for the TURN library's own timers.
 export VKTP_SLOW=${VKTP_SLOW-1}
 
-# 🚨 MAKE THE MACHINE READY, DO NOT ASSUME IT IS. The fork's
-# TestForkDivergesFromUpstreamExactlyHere diffs the vendored tree against
-# PRISTINE upstream, which it reads from the module cache. On a clean checkout
-# that cache is cold and the test t.Fatals -- correctly, because a guard that
-# SKIPS itself when its input is missing is green on every machine nobody set
-# up. Fetching it here is what makes this script self-sufficient.
-#
-# The `@version` form fetches real upstream despite the `replace` in go.mod that
-# points the module at ./third_party/speedtest-go -- which is exactly the point:
-# the guard needs the original to compare against. Checksum-verified against the
-# public sumdb (this repo's go.sum has no showwin entry, again because of the
-# replace).
-UPSTREAM=github.com/showwin/speedtest-go@v1.7.11
-echo "== fetching pristine $UPSTREAM for the fork's upstream-diff guard"
-if go mod download "$UPSTREAM"; then
-    echo "   ready"
-else
-    echo "   FAIL: could not fetch $UPSTREAM -- the fork's divergence guard cannot run" >&2
+# The vendored fork's divergence guard compares against pristine upstream.
+if ! go mod download github.com/showwin/speedtest-go@v1.7.11; then
     fail=1
 fi
 
-run "root module — go test ${goflags[*]} ./..." \
-    go test "${goflags[@]}" ./...
-
-# 🚨 The fork's guards include TestForkDivergesFromUpstreamExactlyHere, which
-# needs pristine upstream in the module cache. It FATALS rather than skipping if
-# it is cold — a guard that skips itself is a guard that is green everywhere it
-# has not been set up.
-run "vendored fork — separate module, not reached by the root ./..." \
+run "Android transport: root Go module" go test "${goflags[@]}" ./...
+run "Vendored speedtest: separate Go module" \
     env -C third_party/speedtest-go go test "${goflags[@]}" ./speedtest/
 
-# 🚨 A FOURTH place since stage 5: the Go bridge is its own module (its go.mod
-# replaces the root module with `..`), so the root ./... never sees
-# csqtt_bridge_test.go — the descriptor-ownership, pump and cleanup checks. Built
-# with the same tag the xcframework is.
-# GODEBUG pinned in the ENVIRONMENT: the bridge's C constructor sets
-# asyncpreemptoff=1 for the iOS runtime, and on the macOS host that setenv can
-# lose the race with the Go runtime's own startup — "signal 16 received on
-# thread with no signal stack / non-Go code disabled sigaltstack" before the
-# first test runs (seen twice on 2026-09-06 under -race). The variable set
-# here is read before either.
-run "WireGuardBridge — separate module, the csqtt bridge lifecycle" \
-    env -C WireGuardBridge GODEBUG=asyncpreemptoff=1 go test "${goflags[@]}" -tags ios .
-
-run "swiftcheck — Swift value types and source scans" \
-    ./tools/swiftcheck/run.sh
-
-echo
-if [ "$fail" = 0 ]; then
-    echo "all suites passed"
-    exit 0
-fi
-echo "SUITES FAILED"
-exit 1
+exit "$fail"

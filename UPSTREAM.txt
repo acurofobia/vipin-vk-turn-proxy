@@ -1,0 +1,3 @@
+Source: https://github.com/anton48/vk-turn-proxy-ios
+Revision: 5daeb9be9d3c7b0bcb4e01650f7c0b922070ab79
+License: GPL-3.0
