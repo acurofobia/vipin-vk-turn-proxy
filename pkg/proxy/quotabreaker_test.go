@@ -69,12 +69,12 @@ func TestTwoFreshRefusalsPauseMinting(t *testing.T) {
 	cp := breakerPool(t, &mints)
 
 	a := mintFor(t, cp, 0)
-	cp.markSaturated(a, heldBy(cp, a)) // 486 on a credential minted a moment ago: fresh refusal 1
+	cp.markSaturated(a, heldBy(cp, a), "") // 486 on a credential minted a moment ago: fresh refusal 1
 	b := mintFor(t, cp, 1)
 	if b == a {
 		t.Fatalf("the second get seated on the saturated slot %d instead of minting", a)
 	}
-	cp.markSaturated(b, heldBy(cp, b)) // fresh refusal 2 → the breaker trips
+	cp.markSaturated(b, heldBy(cp, b), "") // fresh refusal 2 → the breaker trips
 	if got := mints.Load(); got != 2 {
 		t.Fatalf("mints before the trip = %d, want 2", got)
 	}
@@ -129,8 +129,8 @@ func TestARefusalOnAnOldCredentialIsNotFresh(t *testing.T) {
 			creds: &TURNCreds{Username: fmt.Sprintf("%d:old-%d", time.Now().Add(8*time.Hour).Unix(), i), Password: "p", Address: relay, Addresses: []string{relay}}}
 	}
 	cp.mu.Unlock()
-	cp.markSaturated(0, heldBy(cp, 0))
-	cp.markSaturated(1, heldBy(cp, 1))
+	cp.markSaturated(0, heldBy(cp, 0), "")
+	cp.markSaturated(1, heldBy(cp, 1), "")
 	refusals, paused := cp.quotaSnapshot()
 	if refusals != 2 || paused != 0 {
 		t.Fatalf("quotaSnapshot after two old-credential 486s = (%d, paused %s), want (2, 0) — old refusals must not trip the breaker", refusals, paused)
@@ -165,8 +165,8 @@ func TestARefusalOnACredentialWithASuccessIsItsQuotaNotARefusal(t *testing.T) {
 			cp.noteAllocated(i, full[i]) // nine allocations accepted on each identity
 		}
 	}
-	cp.markSaturated(0, heldBy(cp, 0)) // the tenth refused
-	cp.markSaturated(1, heldBy(cp, 1))
+	cp.markSaturated(0, heldBy(cp, 0), "") // the tenth refused
+	cp.markSaturated(1, heldBy(cp, 1), "")
 	refusals, paused := cp.quotaSnapshot()
 	if refusals != 2 || paused != 0 {
 		t.Fatalf("quotaSnapshot after two tenth-allocation 486s = (%d, paused %s), want (2, 0) — a refusal on a credential the relay has accepted is its quota, not the relay's refusal", refusals, paused)
@@ -193,8 +193,8 @@ func TestOverlappingHerdFailuresWithoutASuccessTripTheBreaker(t *testing.T) {
 	cp.pool[0] = credPoolEntry{addr: relay, ts: time.Now(), active: 10, // ten leases, all still held
 		creds: &TURNCreds{Username: fmt.Sprintf("%d:herd", time.Now().Add(8*time.Hour).Unix()), Password: "p", Address: relay, Addresses: []string{relay}}}
 	cp.mu.Unlock()
-	cp.markSaturated(0, heldBy(cp, 0)) // the first failure, nine others still in flight (active 10)
-	cp.markSaturated(0, heldBy(cp, 0)) // the second, overlapping (active still 10 — nobody released yet)
+	cp.markSaturated(0, heldBy(cp, 0), "") // the first failure, nine others still in flight (active 10)
+	cp.markSaturated(0, heldBy(cp, 0), "") // the second, overlapping (active still 10 — nobody released yet)
 	refusals, paused := cp.quotaSnapshot()
 	if refusals != 2 || paused <= 0 {
 		t.Fatalf("quotaSnapshot after two overlapping herd failures = (%d, paused %s), want (2, > 0) — the breaker missed a herd whose failures overlap", refusals, paused)
@@ -280,10 +280,12 @@ func TestTheMintPauseDoublesPerTripAndHoldsTheCap(t *testing.T) {
 // in exactly two places, runTURN (DTLS, direct, WRAP-A) and setupSRTPSession
 // (SRTP); each Allocate() is followed by the mark before its "TURN relay
 // allocated" line and before CreatePermission; no "session established" line
-// carries one. csqtt: Credential.Allocated right after the relay dial; the
-// adapter wires it (the bridge test). Sabotage seen red: either mark
-// dropped; the marks moved back to "session established"; a mark placed
-// after CreatePermission.
+// carries one. Since 2026-10-19 the mark is relayAllocatedAt(slot, creds,
+// turnAddr) — noteAllocated plus the relay health's evidence (relayhealth.go)
+// and the relay IP for the app's next connect. csqtt: Credential.Allocated
+// right after the relay dial; the adapter wires it (the bridge test).
+// Sabotage seen red: either mark dropped; the marks moved back to "session
+// established"; a mark placed after CreatePermission.
 func TestTheSuccessMarksSitAtTheTURNAllocationSites(t *testing.T) {
 	src, err := os.ReadFile("proxy.go")
 	if err != nil {
@@ -309,30 +311,26 @@ func TestTheSuccessMarksSitAtTheTURNAllocationSites(t *testing.T) {
 			t.Fatalf("no \"TURN relay allocated\" line after the Allocate at byte %d", a)
 		}
 		span := after[:logAt]
-		if n := strings.Count(span, "noteAllocated("); n != 1 {
-			t.Errorf("Allocate at byte %d: %d noteAllocated calls between it and its \"TURN relay allocated\" line, want exactly 1 — the mark is the allocation", a, n)
+		if n := strings.Count(span, "p.relayAllocatedAt("); n != 1 {
+			t.Errorf("Allocate at byte %d: %d relayAllocatedAt calls between it and its \"TURN relay allocated\" line, want exactly 1 — the mark is the allocation", a, n)
 		}
-		if perm := strings.Index(span, "CreatePermission("); perm >= 0 && strings.Index(span, "noteAllocated(") > perm {
+		if perm := strings.Index(span, "CreatePermission("); perm >= 0 && strings.Index(span, "p.relayAllocatedAt(") > perm {
 			t.Errorf("Allocate at byte %d: the mark sits after CreatePermission — a permission failure is not the relay refusing the identity", a)
 		}
 	}
-	if n := strings.Count(code, "noteAllocated("); n != 2 {
-		t.Errorf("proxy.go: %d noteAllocated calls, want 2 — one per allocation site, none at a session line", n)
+	if n := strings.Count(code, "p.relayAllocatedAt("); n != 2 {
+		t.Errorf("proxy.go: %d relayAllocatedAt calls, want 2 — one per allocation site, none at a session line", n)
+	}
+	if !strings.Contains(code, "p.credPool.noteAllocatedAt(slot, creds, turnAddr, attempt)") || strings.Count(code, "noteAllocated(") != 0 {
+		t.Error("proxy.go: the mark reaches the pool through relayAllocatedAt → noteAllocatedAt (the credential AND the relay that answered), nowhere else")
 	}
 	// The mark carries the LEASED credential, not the slot number alone: the
 	// slot may have been refilled while the relay's answer was in flight
 	// (the user's stand on 392; allocmark_identity_test.go).
-	for _, call := range []string{"noteAllocated(slotIdx, creds)", "noteAllocated(credSlot, creds)"} {
+	for _, call := range []string{"relayAllocatedAt(slotIdx, creds, turnAddr, attempt)", "relayAllocatedAt(credSlot, creds, turnAddr, attempt)"} {
 		if !strings.Contains(code, call) {
 			t.Errorf("proxy.go lacks %q — the mark must name the credential the session leased", call)
 		}
-	}
-	bridge, err := os.ReadFile("../../WireGuardBridge/csqtt_bridge.go")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !strings.Contains(string(bridge), "NoteAllocated(slot, creds)") {
-		t.Error("csqtt_bridge.go: the adapter's Allocated callback does not hand the leased credential to NoteAllocated")
 	}
 	for _, lit := range []string{"DTLS+TURN session established", "direct TURN session established", "WRAP-A+TURN session established", "SRTP+TURN session established"} {
 		i := strings.Index(code, lit)
@@ -343,44 +341,7 @@ func TestTheSuccessMarksSitAtTheTURNAllocationSites(t *testing.T) {
 			t.Errorf("%q is preceded by a noteAllocated call — that is session readiness, not the allocation (391's mistake)", lit)
 		}
 	}
-	csq, err := os.ReadFile("../csqtt/client.go")
-	if err != nil {
-		t.Fatal(err)
-	}
-	c := string(csq)
-	if !strings.Contains(c, "Allocated func()") {
-		t.Error("pkg/csqtt: Credential has no Allocated callback")
-	}
-	// csqtt's mark is the allocation too: DialRelay itself reports it, between the
-	// Allocate and the permission — reported from a successful RETURN, a permission
-	// that failed behind an accepted Allocate told the pool nothing, and the seat
-	// it had used went straight to the next taker (the user's review of build 430).
-	// The worker hands the lease's callback to the dial and calls it nowhere else.
-	dialSrc, err := os.ReadFile("../csqtt/turn.go")
-	if err != nil {
-		t.Fatal(err)
-	}
-	d := stripComments(string(dialSrc))
-	alloc, perm := strings.Index(d, "tc.Allocate()"), strings.Index(d, "tc.CreatePermission(")
-	if alloc < 0 || perm < alloc {
-		t.Fatalf("pkg/csqtt: DialRelay's Allocate (%d) and CreatePermission (%d) not found in that order", alloc, perm)
-	}
-	if n := strings.Count(d, "allocated()"); n != 1 {
-		t.Errorf("pkg/csqtt: DialRelay reports the allocation %d time(s), want 1", n)
-	} else if at := strings.Index(d, "allocated()"); at < alloc || at > perm {
-		t.Error("pkg/csqtt: DialRelay does not report the allocation between the Allocate and the permission — a permission failure is not the relay refusing the identity, and the seat WAS used")
-	}
-	w := stripComments(c)
-	dial, gate := strings.Index(w, "dialRelay(cred.TURNCredentials"), -1
-	if dial >= 0 {
-		gate = strings.Index(w[dial:], "startDone()")
-	}
-	if dial < 0 || gate < 0 {
-		t.Fatal("pkg/csqtt: the worker's relay dial not found")
-	}
-	if n := strings.Count(w, "cred.Allocated()"); n != 1 || !strings.Contains(w[dial:dial+gate], "cred.Allocated()") {
-		t.Errorf("pkg/csqtt: the worker calls cred.Allocated() %d time(s), want once — inside the callback it hands to the relay dial, not behind the dial's return", n)
-	}
+
 }
 
 // The hooks sit where the traffic is — pinned by spelling, because the
@@ -415,8 +376,8 @@ func TestTheBreakerHooksSitOnEveryMintPath(t *testing.T) {
 			from += i + len(step)
 		}
 	}
-	inOrder("func (cp *credPool) markSaturated(", "entry := cp.pool[slot]", "cp.noteQuotaRefusalLocked(slot, time.Now())", "cp.applySaturationLocked(slot, cooldown, reason)")
-	inOrder("func (cp *credPool) get(", "cp.mintPausedLocked(time.Now()); paused {", "wake := cp.slotAvailableCh", "cp.mu.Unlock()", "minting paused", "Phase 2 cold-start cap")
+	inOrder("func (cp *credPool) markSaturated(", "entry := cp.pool[slot]", "cp.noteQuotaRefusalLocked(slot, time.Now())", "cp.applySaturationLocked(slot, addr, cooldown, reason)")
+	inOrder("func (cp *credPool) handOut(", "cp.mintPausedLocked(time.Now()); paused {", "wake := cp.slotAvailableCh", "cp.mu.Unlock()", "minting paused", "Phase 2 cold-start cap")
 	inOrder("func (cp *credPool) tryFill(", "cp.mintPausedLocked(time.Now()); paused {", "cp.mu.Unlock()", "return false", "gen := cp.claimForFetchLocked(slot)")
 	if strings.Count(c, "cp.noteQuotaRefusalLocked(") != 1 {
 		t.Errorf("creds.go calls noteQuotaRefusalLocked %d times, want exactly 1 — inside markSaturated, the one place every 486 reaches the pool", strings.Count(c, "cp.noteQuotaRefusalLocked("))

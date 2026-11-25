@@ -60,6 +60,7 @@ type relayLeg struct {
 	running int           // started and not yet ended, teardown included
 	joined  bool          // the session is ending: nothing is started behind a join
 	idle    chan struct{} // made by a join that found a leg running; closed by the last one's end
+	ready   chan struct{} // optional DTLS setup barrier, after Allocate and CreatePermission
 
 	gave gaveBack // when the leg gave its allocation back — what the session releases its lease by (seatcool.go)
 }
@@ -109,19 +110,20 @@ func (l *relayLeg) join(budget time.Duration) bool {
 }
 
 // goRunTURN starts a session's relay leg — the ONE place runTURN is started
-// from. The leg has ENDED when runTURN has returned — its deferred teardown
+// from — on the hand-out `generation` (the stamp resolveTURNAddr returned for
+// THIS leg; the direct session starts a leg per hand-out). The leg has ENDED when runTURN has returned — its deferred teardown
 // behind it — and the session has been told (the result on the channel, then
 // after, if any: the DTLS family and WRAP-A cancel the session there, which has
 // no transport without its relay). False, and nothing started, once the session
 // is ending.
-func (p *Proxy) goRunTURN(ctx context.Context, leg *relayLeg, turnAddr string, creds *TURNCreds, conn2 net.PacketConn, connIdx, slotIdx int, after func()) (<-chan error, bool) {
+func (p *Proxy) goRunTURN(ctx context.Context, leg *relayLeg, turnAddr string, creds *TURNCreds, conn2 net.PacketConn, connIdx, slotIdx int, generation uint64, after func()) (<-chan error, bool) {
 	if !leg.start() {
 		return nil, false
 	}
 	ch := make(chan error, 1)
 	go func() {
 		defer leg.done()
-		ch <- p.runTURN(ctx, turnAddr, creds, conn2, connIdx, slotIdx, &leg.gave)
+		ch <- p.runTURN(ctx, turnAddr, creds, conn2, connIdx, slotIdx, generation, &leg.gave, leg.ready)
 		if after != nil {
 			after()
 		}

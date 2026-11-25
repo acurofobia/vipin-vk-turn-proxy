@@ -116,25 +116,44 @@ func (s *sockStats) register(connIdx int, c net.Conn) {
 	if s == nil || connIdx < 0 {
 		return
 	}
+	physical, _ := c.(*physicalConn)
+	if physical != nil {
+		// ClosePhysicalSockets can retire a dial before the caller registers it.
+		physicalNetwork.Lock()
+		defer physicalNetwork.Unlock()
+		if _, open := physicalNetwork.sockets[physical]; !open {
+			return
+		}
+		c = physical.Conn
+	}
 	tc, ok := c.(*net.TCPConn)
 	if !ok || tc == nil {
 		return
 	}
 	s.mu.Lock()
+	if s.conns[connIdx] != tc {
+		delete(s.lastRtx, connIdx)
+	}
 	s.conns[connIdx] = tc
 	s.mu.Unlock()
+	if physical != nil {
+		physical.beforeClose = func() { s.unregister(connIdx, tc) }
+	}
 }
 
 // unregister must run BEFORE the connection is closed. Sampling a closed socket
 // is harmless (the getsockopt fails and the conn is skipped), but holding the
 // reference would keep it reachable.
-func (s *sockStats) unregister(connIdx int) {
+func (s *sockStats) unregister(connIdx int, tcp *net.TCPConn) {
 	if s == nil {
 		return
 	}
 	s.mu.Lock()
-	delete(s.conns, connIdx)
-	delete(s.lastRtx, connIdx)
+	// A late Close from a previous session must leave the replacement socket registered.
+	if s.conns[connIdx] == tcp {
+		delete(s.conns, connIdx)
+		delete(s.lastRtx, connIdx)
+	}
 	s.mu.Unlock()
 }
 

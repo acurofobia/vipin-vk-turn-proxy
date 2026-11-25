@@ -43,20 +43,34 @@ package proxy
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io"
 	"log"
 	mathrand "math/rand"
+	"net"
+	"os"
+	"strings"
+	"syscall"
 	"time"
+
+	"github.com/pion/dtls/v3"
+)
+
+const (
+	defaultWakeProbePoll       = 100 * time.Millisecond
+	defaultWakeProbeFreezeStep = time.Second
 )
 
 // Vars so that a test can shrink them; nothing else writes them.
 var (
-	wakeProbeWindow      = 30 * time.Second       // LISTENING without an answer before the verdict
-	wakeProbeResendEvery = time.Second            // listening between two pings of one probe
-	wakeProbePoll        = 100 * time.Millisecond // how often the mark is looked at
-	wakeProbeFreezeStep  = time.Second            // a poll step longer than this was a freeze, not listening
-	wakeProbeAdopt       = time.Second            // a ping sent this recently is the probe's first ping
-	wakeProbeJitter      = 300 * time.Millisecond // the pool's probes are spread over this much
+	wakeProbeWindow      = 30 * time.Second           // LISTENING without an answer before the verdict
+	wakeProbeResendEvery = time.Second                // listening between two pings of one probe
+	wakeProbePoll        = defaultWakeProbePoll       // how often the mark is looked at
+	wakeProbeFreezeStep  = defaultWakeProbeFreezeStep // a poll step longer than this was a freeze, not listening
+	wakeProbeAdopt       = time.Second                // a ping sent this recently is the probe's first ping
+	wakeProbeJitter      = 300 * time.Millisecond     // the pool's probes are spread over this much
+	wakeProbeRetry       = time.Second                // the pause before an OWED probe is tried again (build 470)
 	wakeProbeClock       = time.Now
 )
 
@@ -188,6 +202,16 @@ var closedWakeCh = func() chan struct{} {
 type wakeWatch struct {
 	p      *Proxy
 	served uint64
+	// owed: a probe begun for the pending wake did not FINISH — its write failed
+	// for a reason that is not the connection's (ENOBUFS, the write's own
+	// deadline; pingWriteFailed let the goroutine go on). The wake stays
+	// pending, and the probe's 30-s throttle does not apply to it: the throttle
+	// is stamped at the probe's start (lastActiveProbeAt), so without this flag
+	// the next turn served the wake without a ping — swallowed (the review of
+	// 815137e, build 470). An owed probe is tried again after wakeProbeRetry,
+	// not at once. Cleared by a verdict; never set by the goroutine's own
+	// context ending.
+	owed bool
 }
 
 // newWakeWatch starts from the present: a wake that came before this session
@@ -206,16 +230,23 @@ func (w *wakeWatch) pending() bool { return w.p.wakeEpoch.Load() != w.served }
 // session kinds. probed = false when this wake needed no probe.
 func (w *wakeWatch) serve(ctx context.Context, connIdx, credSlot int, label string, seq *uint64, lastPingAt *time.Time, send func(seq uint64, now time.Time) error) (alive, probed bool, err error) {
 	epoch := w.p.wakeEpoch.Load()
-	if !w.p.wakeProbeDue(connIdx) {
+	// An OWED probe is made whatever the throttle says: the throttle's stamp is
+	// the unfinished probe's own.
+	if !w.owed && !w.p.wakeProbeDue(connIdx) {
 		w.served = epoch
 		return true, false, nil
 	}
 	// Spread the pool's probes over 0–300 ms: forty Write + SRTP-encrypt bursts
 	// in the same instant once pushed the extension over its memory limit
-	// (2026-05-25).
-	if jitter := mathrand.Int63n(int64(wakeProbeJitter)); jitter > 0 {
+	// (2026-05-25). An owed probe waits the retry pause instead — a refusal a
+	// moment ago is not asked again a moment later.
+	wait := time.Duration(mathrand.Int63n(int64(wakeProbeJitter)))
+	if w.owed {
+		wait = wakeProbeRetry
+	}
+	if wait > 0 {
 		select {
-		case <-time.After(time.Duration(jitter)):
+		case <-time.After(wait):
 		case <-ctx.Done():
 			return true, false, ctx.Err()
 		}
@@ -224,10 +255,19 @@ func (w *wakeWatch) serve(ctx context.Context, connIdx, credSlot int, label stri
 	// The probe asks again at every thaw inside its wait, so whatever woke the
 	// phone while it ran is served by it — UP TO the epoch its verdict read
 	// beside the pong mark, and not one wake further (build 425).
-	if err == nil {
-		w.served = covered
+	if err != nil {
+		// Not finished. The goroutine's own context ending owes nothing (the
+		// goroutine returns at its next turn); any other failure of the probe's
+		// write leaves the wake pending and the probe OWED.
+		// — the context's end read off the context, never off the error's type:
+		// a DTLS write timeout wraps context.DeadlineExceeded with the context
+		// alive, and owed it is (the review of 7cca145).
+		w.owed = ctx.Err() == nil
+		return alive, true, err
 	}
-	return alive, true, err
+	w.owed = false
+	w.served = covered
+	return alive, true, nil
 }
 
 // wakeProbeDue: is this wake to be probed on this connection at all?
@@ -416,7 +456,7 @@ func pingStamp(wokeInside bool, started, finished time.Time) time.Time {
 // pong from before the sleep for an answer. Now the stamp is voided the moment
 // seq moves, and says afterwards what pingStamp allows — here and in the probe's
 // own ping alike; nobody else writes either of the two.
-func (p *Proxy) tickPing(seq *uint64, lastPingAt *time.Time, now time.Time, send func(seq uint64, now time.Time) error) error {
+func (p *Proxy) tickPing(seq *uint64, lastPingAt *time.Time, now time.Time, send func(seq uint64, now time.Time) error, conn io.Writer, connIdx int, gen uint64) error {
 	*seq++
 	*lastPingAt = time.Time{} // seq names a ping that is not sent yet: the stamp of the one before says nothing about it
 	epoch := p.wakeEpoch.Load()
@@ -424,5 +464,149 @@ func (p *Proxy) tickPing(seq *uint64, lastPingAt *time.Time, now time.Time, send
 		return err
 	}
 	*lastPingAt = pingStamp(p.wakeEpoch.Load() != epoch, now, wakeProbeClock())
+	// The relay's pace declared AGAIN behind every tick's ping (the user's
+	// review of 9d58dda): the one copy behind the hello is a UDP datagram on
+	// the relay → server leg whatever the leg to the relay, and a lost copy
+	// left the server at the wrong rate for the session. The server reads a
+	// repeat of the same word as no change; 20 bytes per tick.
+	p.sendPaceDeclaration(conn, connIdx)
+	p.sendReplaceDeclaration(conn, connIdx, gen) // the replacement named again (groupReplaceMagic), the session's own generation: a lost copy heals the same way
 	return nil
+}
+
+// pingWriteFailed is the ONE verdict on a failed ping write, for both session
+// kinds and for both pings — the periodic tick's and the wake probe's (build
+// 469). It answers whether the probe goroutine is to END: true when the write
+// found the CONNECTION gone — the session is ended here and now, through
+// connCancel — and false for every other error, when the goroutine goes on.
+//
+// Up to 468 the goroutine returned on ANY error of the write, and took the
+// zombie detector — which lives in it — with it: nobody was left to judge the
+// connection. The comment there said the other goroutines would handle the
+// teardown; they do not. The recv goroutine's read timeout is judged by the
+// GLOBAL receive clock (one live neighbour hides a dead connection), and the
+// writer waits in the shared send queue for a packet, which it then loses —
+// one packet per dead session. On an idle phone that is a packet every few
+// seconds: behind a relay's loss the forty dead sessions went one by one,
+// ≈ 2.5 min with no uplink and 40/40 on the screen (2026-11-02, the user's
+// run on 467). On iOS the kernel gives up on a dead TCP connection within
+// ≈ 2 min and the ping's write — 12 bytes every 30 s — is usually the FIRST
+// write to meet it (EPIPE), ahead of the zombie detector's 120 s.
+//
+// The rule: the connection gone (a broken pipe, a reset, the kernel's own
+// give-up, a closed socket) ends the session at once, whatever the traffic —
+// every dead session is gone within one tick of the kernel's give-up. The
+// write's own deadline, a moment's refusal, a route away for now (the path
+// hook's business) end NOTHING: the ping is counted as not sent, the goroutine
+// goes on, and the zombie detector judges the connection by its pongs. The
+// goroutine's own context having ended (ctx.Err()) is no verdict and no line. 🚫 Never a bare
+// return on a ping's write error, in either session kind, at either ping —
+// the scan test pins the four sites; and the line names the cause, never an
+// address (the socket's error carries both ends).
+func (p *Proxy) pingWriteFailed(ctx context.Context, connIdx, credSlot int, label string, err error, connCancel func()) (stop bool) {
+	// The goroutine's own end is read off ITS CONTEXT, never off the error's
+	// type: pion/dtls reports an expired write deadline as an error that wraps
+	// context.DeadlineExceeded while the context is alive (the review of
+	// 7cca145) — that is a mere failure, said below; and under an ended
+	// context nothing is judged, whatever the write said.
+	if ctx.Err() != nil {
+		return false // the loop meets connCtx.Done at its next turn
+	}
+	if pingWriteGone(err) {
+		log.Printf("proxy: [conn %d on slot %d] %sthe ping's write found the connection gone (%s) — the session ends", connIdx, credSlot, label, pingWriteCause(err))
+		connCancel()
+		return true
+	}
+	log.Printf("proxy: [conn %d] %sthe ping's write failed (%s) — the probe goes on, the zombie detector judges the connection", connIdx, label, pingWriteCause(err))
+	return false
+}
+
+// pingJoinBudget bounds a session's wait for its ping goroutine at the
+// session's end. What the wait spans: the goroutine's current turn — a ping's
+// write under its 5-s deadline at worst, a probe's listening step, a select
+// that leaves at once on the cancel. A var so that a test can shrink it;
+// nothing else writes it.
+var pingJoinBudget = time.Second
+
+// joinPingLoop: a session returns AFTER its ping goroutine has left (the
+// gate's fixture race of 2026-11-03: a session's ping goroutine of an EARLIER
+// test, leaving on its context at its own time, read the probe's package
+// state while the next test's fixture wrote it — a session that returned
+// without its goroutine left it reading behind the session's back). Deferred
+// right behind the goroutine's start, in both session kinds, so it runs
+// before the defers registered earlier — the relay leg's join and the
+// credential's release among them. The session's context is cancelled first
+// (idempotent); the goroutine leaves at its next select, or when its write's
+// deadline frees it. Bounded: after pingJoinBudget the session returns
+// WITHOUT its ping goroutine and says so — a stop must not wait for a write
+// that the connection's teardown will end anyway.
+func (p *Proxy) joinPingLoop(connCancel func(), done <-chan struct{}, connIdx int, label string) bool {
+	connCancel()
+	timer := time.NewTimer(pingJoinBudget)
+	defer timer.Stop()
+	select {
+	case <-done:
+		return true
+	case <-timer.C:
+		log.Printf("proxy: [conn %d] %sthe session returns WITHOUT its ping goroutine (not ended within %s) — it ends by itself", connIdx, label, pingJoinBudget)
+		return false
+	}
+}
+
+// pingWriteGone says whether a ping write's error means the CONNECTION is gone
+// — a reset, a broken pipe, the kernel's own give-up, a closed socket (the
+// socket's, pion/dtls's) — as opposed to the write's own deadline, a moment's
+// refusal (EAGAIN, ENOBUFS) or a route away for now (unreachable). The errno
+// is asked first; a library that wraps without %w is read by the words a
+// socket's error carries (the recv loops judge their read deadline the same
+// way).
+func pingWriteGone(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, net.ErrClosed) || errors.Is(err, io.ErrClosedPipe) || errors.Is(err, dtls.ErrConnClosed) {
+		return true
+	}
+	var errno syscall.Errno
+	if errors.As(err, &errno) {
+		switch errno {
+		case syscall.EPIPE, syscall.ECONNRESET, syscall.ECONNABORTED, syscall.ENOTCONN, syscall.ETIMEDOUT:
+			return true
+		}
+		return false
+	}
+	if errors.Is(err, os.ErrDeadlineExceeded) {
+		return false
+	}
+	s := err.Error()
+	return strings.Contains(s, "broken pipe") || strings.Contains(s, "connection reset") || strings.Contains(s, "use of closed network connection")
+}
+
+// pingWriteCause is what the line says about the error: the errno's own words,
+// the deadline's, a closed socket's — never the error's full text, which for a
+// socket's write names both ends of the connection.
+func pingWriteCause(err error) string {
+	var errno syscall.Errno
+	if errors.As(err, &errno) {
+		return errno.Error()
+	}
+	switch {
+	case errors.Is(err, os.ErrDeadlineExceeded):
+		return os.ErrDeadlineExceeded.Error()
+	case errors.Is(err, context.DeadlineExceeded):
+		return context.DeadlineExceeded.Error() // pion/dtls's write timeout wraps it
+	case errors.Is(err, net.ErrClosed):
+		return net.ErrClosed.Error()
+	case errors.Is(err, io.ErrClosedPipe):
+		return io.ErrClosedPipe.Error()
+	case errors.Is(err, dtls.ErrConnClosed):
+		return "the DTLS connection is closed"
+	}
+	s := err.Error()
+	for _, w := range []string{"broken pipe", "connection reset by peer", "use of closed network connection"} {
+		if strings.Contains(s, w) {
+			return w
+		}
+	}
+	return "a write error"
 }

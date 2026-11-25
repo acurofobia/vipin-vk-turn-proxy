@@ -72,8 +72,8 @@ func TestALateSuccessOfTheOldCredentialDoesNotCertifyTheNew(t *testing.T) {
 			if a := allocatedOn(cp, slot); a != 0 {
 				t.Fatalf("allocated on the refilled slot = %d after the OLD credential's late success, want 0 — a slot number is not a credential", a)
 			}
-			cp.markSaturated(slot, fresh) // B's own 486s: fresh, and nothing ever succeeded on B
-			cp.markSaturated(slot, fresh)
+			cp.markSaturated(slot, fresh, "") // B's own 486s: fresh, and nothing ever succeeded on B
+			cp.markSaturated(slot, fresh, "")
 			if refusals, paused := cp.quotaSnapshot(); refusals != 2 || paused <= 0 {
 				t.Fatalf("after two fresh 486s on the refilled credential: (%d, paused %s), want (2, > 0) — the breaker took the new credential for an accepted one", refusals, paused)
 			}
@@ -210,10 +210,10 @@ func TestALateAllocateAnswerMarksTheCredentialItWasIssuedTo(t *testing.T) {
 			conn1, conn2 := connutil.AsyncPacketPipe()
 			defer conn1.Close()
 			defer conn2.Close()
-			return p.runTURN(ctx, relay, old, conn2, 0, 0, nil)
+			return p.runTURN(ctx, relay, old, conn2, 0, 0, 0, nil, nil)
 		}},
 		{"setupSRTPSession — where SRTP allocates", func(ctx context.Context, p *Proxy, relay string) error {
-			c, err := p.setupSRTPSession(ctx, relay, old, 0, 0, nil)
+			c, err := p.setupSRTPSession(ctx, relay, old, 0, 0, nil, 0)
 			if c != nil {
 				_ = c.Close()
 			}

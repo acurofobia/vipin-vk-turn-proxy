@@ -1,10 +1,14 @@
 package proxy
 
 import (
+	"context"
 	"net"
 	"os"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/cbeuw/connutil"
 )
 
 // An instrument that cannot see must say nothing, not say zero — a line of
@@ -20,7 +24,7 @@ func TestSockStatsIsSilentWithNothingToSample(t *testing.T) {
 		t.Fatalf("nil summary = %q, want empty", got)
 	}
 	nilS.register(0, nil)
-	nilS.unregister(0)
+	nilS.unregister(0, nil)
 }
 
 // register must ignore anything that is not a TCP connection, so the UDP
@@ -78,7 +82,7 @@ func deltaFor(s *sockStats, idx int, cur uint64) uint64 {
 func TestUnregisterClearsTheBaseline(t *testing.T) {
 	s := newSockStats()
 	s.lastRtx[2] = 900
-	s.unregister(2)
+	s.unregister(2, nil)
 	if _, ok := s.lastRtx[2]; ok {
 		t.Fatal("unregister left the retransmit baseline for conn 2 behind")
 	}
@@ -150,47 +154,58 @@ func TestWindowIsReportedForTheConnectionThatIsBackedUp(t *testing.T) {
 	}
 }
 
-// 🚨 THE GUARD THAT WAS MISSING, AND IT COST A DEVICE RUN. Build 233 registered
-// the socket in runTURN and shipped. SRTP is the production transport and dials
-// its TURN connection somewhere else entirely, so `sock=` appeared in exactly
-// ZERO lines of the first run — the instrument compiled, tested green, and was
-// never fed.
-//
-// The write-timing guard below existed and passed the whole time, because it
-// guards the OTHER half. Guarding one half of a two-part wiring is how you get a
-// green suite and an empty log.
+// Hold the first reply until the registered socket can be inspected on both actual dial paths.
 func TestEveryTURNDialIsRegisteredForSampling(t *testing.T) {
-	src, err := os.ReadFile("proxy.go")
-	if err != nil {
-		t.Fatalf("read proxy.go: %v", err)
-	}
-	lines := strings.Split(string(src), "\n")
-	dials := 0
-	for i, ln := range lines {
-		// Both forms in use: d.DialContext(ctx, "tcp", turnAddr) and
-		// dialer.Dial("tcp", turnAddr).
-		if !strings.Contains(ln, `"tcp", turnAddr`) {
-			continue
-		}
-		dials++
-		registered := false
-		for j := i; j < i+14 && j < len(lines); j++ {
-			if strings.Contains(lines[j], "sockStats.register(") {
-				registered = true
-				break
+	for _, transport := range []string{"runTURN", "setupSRTPSession"} {
+		t.Run(transport, func(t *testing.T) {
+			tap := newPermissionMutingTap(t, loopbackTURN(t), true, false)
+			p := &Proxy{peer: silentPeer(t), sockStats: newSockStats()}
+			creds := &TURNCreds{Username: "unknown-fixture-user", Password: "unused"}
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			done := make(chan error, 1)
+			go func() {
+				if transport == "runTURN" {
+					a, b := connutil.AsyncPacketPipe()
+					defer a.Close()
+					defer b.Close()
+					done <- p.runTURN(ctx, tap.addr(), creds, b, 0, 0, 0, nil, nil)
+				} else {
+					conn, err := p.setupSRTPSession(ctx, tap.addr(), creds, 0, 0, nil, 0)
+					if conn != nil {
+						_ = conn.Close()
+					}
+					done <- err
+				}
+			}()
+			select {
+			case <-tap.requested:
+			case err := <-done:
+				t.Fatalf("dial ended before the fixture saw a request: %v", err)
+			case <-ctx.Done():
+				t.Fatal("fixture did not see the request")
 			}
-		}
-		if !registered {
-			t.Errorf("proxy.go:%d dials a TURN relay over TCP and never calls "+
-				"sockStats.register — that transport's sockets are invisible, and "+
-				"`sock=` will simply be absent from the log rather than wrong",
-				i+1)
-		}
-	}
-	if dials < 2 {
-		t.Fatalf("found %d TCP dials to turnAddr, expected at least 2 (runTURN and "+
-			"setupSRTPSession) — the scan is not finding them and this test is "+
-			"passing vacuously", dials)
+			p.sockStats.mu.Lock()
+			tcp := p.sockStats.conns[0]
+			p.sockStats.mu.Unlock()
+			if tcp == nil || tcp.RemoteAddr().String() != tap.addr() {
+				t.Error("live relay TCP socket missing from sampler")
+			}
+			tap.release()
+			select {
+			case err := <-done:
+				if err == nil {
+					t.Fatal("fixture must reject the unknown user")
+				}
+			case <-ctx.Done():
+				t.Fatal("setup did not return after the refusal")
+			}
+			p.sockStats.mu.Lock()
+			defer p.sockStats.mu.Unlock()
+			if len(p.sockStats.conns) != 0 {
+				t.Error("sampler retained the closed socket after setup failed")
+			}
+		})
 	}
 }
 

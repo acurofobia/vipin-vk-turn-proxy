@@ -94,3 +94,47 @@ func TestStopWaitsForWorkersAndRejectsLateWorkers(t *testing.T) {
 		t.Fatal("late worker started after stop")
 	}
 }
+
+func TestPhysicalSamplerTracksReplacementAndShutdown(t *testing.T) {
+	listener, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	SetPhysicalNetwork(nil, nil)
+	defer SetPhysicalNetwork(nil, nil)
+	s := newSockStats()
+	dial := func() net.Conn {
+		c, err := dialPhysical(context.Background(), "tcp4", listener.Addr().String(), time.Second)
+		if err != nil {
+			t.Fatal(err)
+		}
+		s.register(0, c)
+		return c
+	}
+	old := dial()
+	next := dial()
+	_ = old.Close()
+	if s.conns[0] == nil || s.conns[0].LocalAddr().String() != next.LocalAddr().String() {
+		t.Fatal("late close removed the replacement socket")
+	}
+	ClosePhysicalSockets()
+	s.register(0, next)
+	if len(s.conns) != 0 {
+		t.Fatal("closed physical socket still registered")
+	}
+}
+
+func TestTURNOverrideResolutionUsesPhysicalNetwork(t *testing.T) {
+	SetPhysicalNetwork(nil, func(host string) ([]string, error) {
+		if host != "relay.physical.invalid" {
+			t.Fatalf("unexpected hostname %q", host)
+		}
+		return []string{"192.0.2.41"}, nil
+	})
+	defer SetPhysicalNetwork(nil, nil)
+	got := ResolveTURNServers(context.Background(), []string{"relay.physical.invalid:3478"}, nil)
+	if len(got) != 1 || got[0] != "192.0.2.41:3478" {
+		t.Fatalf("relay resolution bypassed physical network: %v", got)
+	}
+}

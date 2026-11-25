@@ -36,7 +36,10 @@ func SetPhysicalNetwork(protect func(int32) error, resolve func(string) ([]strin
 	physicalNetwork.Unlock()
 }
 
-func socketControl(_ string, _ string, raw syscall.RawConn) error {
+func socketControl(network string, address string, raw syscall.RawConn) error {
+	if err := beforeDial(network, address); err != nil {
+		return err
+	}
 	physicalNetwork.RLock()
 	protect := physicalNetwork.protect
 	physicalNetwork.RUnlock()
@@ -117,11 +120,18 @@ func resolvePhysicalUDP(ctx context.Context, address string) (*net.UDPAddr, erro
 	return net.ResolveUDPAddr("udp4", net.JoinHostPort(ips[0], port))
 }
 
-type physicalConn struct{ net.Conn }
+type physicalConn struct {
+	net.Conn
+	beforeClose func() // guarded by physicalNetwork; removes this socket from the TCP sampler
+}
 
 func (c *physicalConn) Close() error {
 	physicalNetwork.Lock()
 	delete(physicalNetwork.sockets, c)
+	if c.beforeClose != nil {
+		c.beforeClose()
+		c.beforeClose = nil
+	}
 	physicalNetwork.Unlock()
 	return c.Conn.Close()
 }
@@ -166,7 +176,7 @@ func dialPhysical(ctx context.Context, network, address string, timeout time.Dur
 			err = dialErr
 			continue
 		}
-		wrapped := &physicalConn{conn}
+		wrapped := &physicalConn{Conn: conn}
 		physicalNetwork.Lock()
 		if epoch != physicalNetwork.epoch || physicalNetwork.stopped || ctx.Err() != nil {
 			physicalNetwork.Unlock()
@@ -184,11 +194,23 @@ func dialPhysical(ctx context.Context, network, address string, timeout time.Dur
 }
 
 func ClosePhysicalSockets() {
+	closePhysicalSockets(true)
+}
+
+// NetworkChanged retires sockets bound to the old physical network while
+// allowing replacement dials through the installation's current hooks.
+func (p *Proxy) NetworkChanged() {
+	p.OnPathChange()
+	closePhysicalSockets(false)
+	p.OnPathUp()
+}
+
+func closePhysicalSockets(stopped bool) {
 	physicalNetwork.Lock()
 	sockets := physicalNetwork.sockets
 	physicalNetwork.sockets = nil
 	physicalNetwork.epoch++
-	physicalNetwork.stopped = true
+	physicalNetwork.stopped = stopped
 	physicalNetwork.Unlock()
 	for conn := range sockets {
 		_ = conn.Close()

@@ -45,17 +45,17 @@ import (
 // proxy.Config.NumConns sizes Proxy's (poolSizeForNumConns); the rest mirror
 // the same-named proxy.Config fields.
 type CredPoolConfig struct {
-	VKLink     string        // VK call invite link or bare link id, as proxy.Config.VKLink
-	NumConns   int           // connections the pool must host; pool size = poolSizeForNumConns(NumConns)
-	Cooldown   time.Duration // post-failure skip-fetch window per slot; <=0 → the pool's default (2 min)
-	CachePath  string        // on-disk JSON cache (the app's creds-pool.json); empty disables persistence
-	TurnServer string        // optional TURN host override applied to every fresh mint
-	TurnPort   string        // optional TURN port override
+	VKLink      string        // VK call invite link or bare link id, as proxy.Config.VKLink
+	NumConns    int           // connections the pool must host; pool size = poolSizeForNumConns(NumConns)
+	Cooldown    time.Duration // post-failure skip-fetch window per slot; <=0 → the pool's default (2 min)
+	CachePath   string        // on-disk JSON cache (the app's creds-pool.json); empty disables persistence
+	TurnServer  string        // optional TURN host override (the older pair; TurnServers wins when set)
+	TurnPort    string        // optional TURN port override
+	TurnServers []string      // optional TURN relays, host:port each, or TURNServersVK for VK's own in its place — applied to EVERY credential when it is handed out, cached ones included (relayhealth.go)
 	// SeededTURN pre-fills slot 0 (the app's pre-bootstrap captcha flow hands
 	// it over), so the first acquire needs no VK call — without it the
-	// captcha lands inside iOS's .connecting window. Used VERBATIM: the
-	// TurnServer/TurnPort override does not apply to a seed, exactly as in
-	// NewProxy ("a setting must not affect cached creds").
+	// captcha lands inside iOS's .connecting window. The override applies to
+	// it as to every credential, when it is handed out (since 2026-10-19).
 	SeededTURN *TURNCreds
 	// Fetch replaces the standard VK fetcher (tests, or another minter). It
 	// must return ("host:port", creds, nil) with creds.Addresses non-empty.
@@ -67,7 +67,7 @@ type CredPool struct {
 	cp       *credPool
 	numConns int
 	linkID   string
-	relayIP  atomic.Value    // string: first host of the last fresh mint
+	relayIP  atomic.Value    // string: the host of the last allocation (NoteAllocatedAt)
 	pace     growPace        // set before Grow starts; tests shrink it
 	ctx      context.Context // the pool's own lifetime: the saver, Grow; ended by Close
 	cancel   context.CancelFunc
@@ -105,15 +105,18 @@ func NewCredPool(ctx context.Context, cfg CredPoolConfig) *CredPool {
 	size := poolSizeForNumConns(cfg.NumConns)
 	if cookieAuthEnabled.Load() {
 		if n := len(cookieLinks()); n > 0 {
-			size = 2 * n
+			size = 2 * n // two per link; the list's fixed entries are added by setOverride (growForListLocked)
 		}
 	}
 	p.cp = newCredPool(ctx, size, cfg.Cooldown, cfg.CachePath, fetch)
 	p.cp.setColdStartTarget(cfg.NumConns)
+	p.cp.setOverride(turnOverride{servers: ResolveTURNServers(ctx, cfg.TurnServers, resolvedVKHostIPs), raw: cfg.TurnServers, host: cfg.TurnServer, port: cfg.TurnPort}) // names → IPs first (#105)
 	if cfg.SeededTURN != nil {
-		if host, _, err := net.SplitHostPort(cfg.SeededTURN.Address); err == nil {
+		if _, _, err := net.SplitHostPort(cfg.SeededTURN.Address); err == nil {
 			p.cp.seedSlot(0, cfg.SeededTURN.Address, cfg.SeededTURN)
-			p.relayIP.Store(host)
+			if host, ok := relayHostToPublish(cfg.SeededTURN.Address); ok {
+				p.relayIP.Store(host)
+			}
 		} else {
 			log.Printf("credpool: SeededTURN address %q is not host:port (%v) — ignoring", cfg.SeededTURN.Address, err)
 		}
@@ -158,7 +161,7 @@ func (p *CredPool) standardFetch(cfg CredPoolConfig) func(bool, int) (string, *T
 		var creds *TURNCreds
 		if cookieAuthEnabled.Load() {
 			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-			c, cerr := cookieCredForSlot(ctx, slot)
+			c, cerr := cookieCredForSlot(ctx, slot, p.cp.overrideServers(), p.cp.heldRelaysExcept(slot), p.cp.quarantinedRelays()) // the pool's list, resolved (#105)
 			cancel()
 			if cerr != nil {
 				if errors.Is(cerr, ErrCookieRejected) {
@@ -175,39 +178,20 @@ func (p *CredPool) standardFetch(cfg CredPoolConfig) func(bool, int) (string, *T
 			}
 			creds = c
 		}
-		addr, err := applyTURNOverride(creds, cfg.TurnServer, cfg.TurnPort)
-		if err != nil {
-			return "", nil, err
+		// VK's own addresses, all of them, into the pool and the cache; the
+		// override is applied when the credential is handed out, and the
+		// relay IP published at the allocation (NoteAllocatedAt).
+		if creds == nil || len(creds.Addresses) == 0 {
+			return "", nil, errors.New("VK returned no TURN address")
 		}
-		if host, _, herr := net.SplitHostPort(addr); herr == nil {
-			p.relayIP.Store(host)
+		for _, vkAddr := range creds.Addresses {
+			if _, _, err := net.SplitHostPort(vkAddr); err != nil {
+				return "", nil, fmt.Errorf("parse TURN address %q: %w", vkAddr, err)
+			}
 		}
-		return addr, creds, nil
+		creds.Address = creds.Addresses[0]
+		return creds.Addresses[0], creds, nil
 	}
-}
-
-// applyTURNOverride rewrites every VK-returned address with the optional
-// host/port override — the fresh-fetch path only, exactly as Proxy does —
-// and returns the primary address.
-func applyTURNOverride(creds *TURNCreds, server, port string) (string, error) {
-	if creds == nil || len(creds.Addresses) == 0 {
-		return "", errors.New("VK returned no TURN address")
-	}
-	for i, vkAddr := range creds.Addresses {
-		h, pport, err := net.SplitHostPort(vkAddr)
-		if err != nil {
-			return "", fmt.Errorf("parse TURN address %q: %w", vkAddr, err)
-		}
-		if server != "" {
-			h = server
-		}
-		if port != "" {
-			pport = port
-		}
-		creds.Addresses[i] = net.JoinHostPort(h, pport)
-	}
-	creds.Address = creds.Addresses[0]
-	return creds.Addresses[0], nil
 }
 
 // Acquire hands connIdx a credential by the pool's policy: its own slot
@@ -225,10 +209,11 @@ func (p *CredPool) Acquire(connIdx int) (addr string, creds *TURNCreds, slot int
 }
 
 // Release returns a connection's hold on its slot (call when the allocation
-// is gone). creds is the credential Acquire handed out with that slot: the
-// slot may have been refilled since, and a release counts only against the
-// credential it names (credPool.release).
-func (p *CredPool) Release(slot int, creds *TURNCreds) { p.cp.release(slot, creds) }
+// is gone). creds is the credential Acquire handed out with that slot, addr
+// the relay it handed out: the slot may have been refilled since, and a
+// release counts only against the credential it names (credPool.release) —
+// and off the seats of the relay it names (relayhist.go).
+func (p *CredPool) Release(slot int, creds *TURNCreds, addr string) { p.cp.release(slot, creds, addr) }
 
 // ReleaseGivenBack is Release for a lease whose ALLOCATION was given back to the
 // relay at `at` (the deallocate written, as far as the caller can tell): the VK
@@ -236,17 +221,29 @@ func (p *CredPool) Release(slot int, creds *TURNCreds) { p.cp.release(slot, cred
 // the pool keeps counting it that long — a re-dial is seated elsewhere, or
 // parks, instead of being refused with 486 (seatcool.go). A lease that never
 // held an allocation goes through Release.
-func (p *CredPool) ReleaseGivenBack(slot int, creds *TURNCreds, at time.Time) {
-	p.cp.releaseGivenBack(slot, creds, at)
+func (p *CredPool) ReleaseGivenBack(slot int, creds *TURNCreds, addr string, at time.Time) {
+	p.cp.releaseGivenBack(slot, creds, addr, at)
 }
 
-// MarkSaturated records a 486 (allocation quota reached) on creds, the
-// credential the caller leased from slot, and returns the cooldown applied —
-// zero when the slot no longer holds that credential, or when the refusal is
-// the relay's second behind a seat this side has just given back (nothing is
-// marked either way — seatcool.go).
-func (p *CredPool) MarkSaturated(slot int, creds *TURNCreds) time.Duration {
-	return p.cp.markSaturated(slot, creds)
+// ReleaseHeld is Release for a lease whose allocation is OUT OF REACH: the relay
+// answered its deallocate with 437, or not at all (why says which, for the
+// log). Either way the allocation may live on at the relay — under another
+// mapping of the caller's socket — and hold its seat on the identity's quota
+// until it expires, so the pool keeps counting the seat until `until`, a
+// WALL-clock moment (seatcool.go, holdSeat). No give-back is noted: a 486
+// behind a held seat is not the relay's second and benches the slot as any
+// other. A caller that KNOWS the allocation has expired goes through Release.
+func (p *CredPool) ReleaseHeld(slot int, creds *TURNCreds, addr string, until time.Time, why string) {
+	p.cp.holdSeat(slot, creds, addr, until, why)
+}
+
+// MarkSaturated records a 486 (allocation quota reached) from relay addr on
+// creds, the credential the caller leased from slot, and returns the cooldown
+// applied — on THAT relay (relayhist.go); zero when the slot no longer holds
+// that credential, or when the refusal is the relay's second behind a seat
+// this side has just given back (nothing is marked either way — seatcool.go).
+func (p *CredPool) MarkSaturated(slot int, creds *TURNCreds, addr string) time.Duration {
+	return p.cp.markSaturated(slot, creds, addr)
 }
 
 // NoteAllocated reports that the relay ACCEPTED an allocation on creds, the
@@ -255,6 +252,32 @@ func (p *CredPool) MarkSaturated(slot int, creds *TURNCreds) time.Duration {
 // success of a credential the slot has since given up must not certify
 // the one there now (quotabreaker.go).
 func (p *CredPool) NoteAllocated(slot int, creds *TURNCreds) { p.cp.noteAllocated(slot, creds) }
+
+// NoteAllocatedAt is NoteAllocated with the relay that answered and when the
+// attempt began: the relay health's evidence that the network works and that
+// addr is alive (an attempt begun before the last path change is no evidence),
+// and the host RelayIP reports from now on (relayhealth.go).
+func (p *CredPool) NoteAllocatedAt(slot int, creds *TURNCreds, addr string, start time.Time) {
+	p.cp.noteAllocatedAt(slot, creds, addr, start)
+	if host, ok := relayHostToPublish(addr); ok { // an IP or nothing (#105)
+		p.relayIP.Store(host)
+	}
+}
+
+// NoteRelayUnanswered reports an Allocate on addr that got NO answer from
+// the relay — connIdx's attempt on creds, the credential it leased from slot,
+// begun at start, failed with err (its kind — a timeout's silence or the
+// path's errno — decides what counts as evidence; relayhealth.go). The connection's next attempt takes the next candidate;
+// the relay is marked unreachable only with evidence that the network works
+// (relayhealth.go).
+func (p *CredPool) NoteRelayUnanswered(connIdx, slot int, creds *TURNCreds, addr string, start time.Time, err error) {
+	p.cp.noteRelayFailure(connIdx, slot, creds, addr, start, !pathSpoke(err))
+}
+
+// IsRelayUnanswered reports an Allocate the relay never answered — a dial
+// timeout, pion's retransmissions run out, a refused connection — as opposed
+// to a STUN error response or this host's own route error.
+func IsRelayUnanswered(err error) bool { return isRelayUnanswered(err) }
 
 // RecordAuthError counts a 401/403 on the slot (pre-kill attribution).
 func (p *CredPool) RecordAuthError(slot int) { p.cp.recordAuthError(slot) }
@@ -298,7 +321,7 @@ func (p *CredPool) ExtendPause(d time.Duration) { p.cp.ExtendPauseAcquireForTran
 // parked acquire succeed; take a fresh channel after every wake.
 func (p *CredPool) SlotAvailable() <-chan struct{} { return p.cp.slotAvailableChannel() }
 
-// RelayIP is the host of the last fresh mint, falling back to the first host
+// RelayIP is the host of the last allocation, falling back to the first host
 // the pool holds — so it is NOT empty after a warm-cache start, which
 // Proxy.TURNServerIP is (seen 2026-09-05: the console client pinned no relay
 // and the tunnel swallowed its own relay sockets).
@@ -308,8 +331,10 @@ func (p *CredPool) RelayIP() string {
 			return s
 		}
 	}
-	if hosts := p.RelayHosts(); len(hosts) > 0 {
-		return hosts[0]
+	for _, h := range p.RelayHosts() {
+		if net.ParseIP(h) != nil { // an IP or nothing — never a name, the fallback included (#105, the user's review of 453)
+			return h
+		}
 	}
 	return ""
 }

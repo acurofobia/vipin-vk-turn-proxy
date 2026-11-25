@@ -64,11 +64,21 @@ var (
 	cookieAuthFatal   atomic.Value // string — non-empty when the cookie was rejected/expired (re-login required)
 	cookieLinksStore  atomic.Value // []string — call-link IDs for the multi-relay cookie pool
 
-	cookieMu          sync.Mutex
-	cookieCache       = map[string]*cookieCachedCred{} // linkID -> last successful mint (multi-relay)
-	cookieRelayList   []cookieRelayRef                 // deduped, ordered DISTINCT relay addrs (slot s -> [s])
-	cookieRelaySeen   = map[string]bool{}              // relay-address dedup set
-	cookieDiscoverIdx int                              // # call links already minted for relay discovery
+	cookieMu            sync.Mutex
+	cookieCache         = map[string]*cookieCachedCred{} // linkID -> last successful mint (multi-relay)
+	cookieRelayList     []cookieRelayRef                 // deduped, ordered DISTINCT relay addrs (slot s -> [s])
+	cookieRelaySeen     = map[string]bool{}              // relay-address dedup set
+	cookieDiscoverIdx   int                              // # call links already minted for relay discovery
+	cookieRelayAssigned = map[int]string{}               // slot -> the relay handed to it in this process (stable across refills while no other slot holds it)
+
+	// cookieAssignMu guards cookieRelayAssigned ALONE and is never held across
+	// I/O: the minter takes it for a moment under cookieMu, the pool under
+	// cp.mu (syncMinterLocked → cookieNoteSlotRelay) — never cookieMu, which
+	// the minter holds for the length of its HTTP request (the user's review
+	// of 456: one slow mint held the whole pool for up to the fetch's 30 s).
+	// Lock order: cookieMu → cookieAssignMu and cp.mu → cookieAssignMu; nothing
+	// is taken under cookieAssignMu.
+	cookieAssignMu sync.Mutex
 )
 
 // cookieCachedCred caches one call's minted (multi-relay) cred so both of its
@@ -112,7 +122,38 @@ func SetVKCookieAuth(enabled bool, cookieHeader string, links []string) {
 	cookieRelayList = nil
 	cookieRelaySeen = map[string]bool{}
 	cookieDiscoverIdx = 0
+	cookieAssignMu.Lock()
+	cookieRelayAssigned = map[int]string{}
+	cookieAssignMu.Unlock()
 	cookieMu.Unlock()
+}
+
+// cookieNoteSlotRelay: the pool tells the minter what slot dials now under a
+// TURN override list ("" — nothing): the reservation follows the placement
+// and the re-binding (credPool.syncMinterLocked). The minter records its own
+// pick through it too. Takes cookieAssignMu alone — 🚫 never cookieMu, which
+// the minter holds across its HTTP request (the user's review of 456).
+func cookieNoteSlotRelay(slot int, relay string) {
+	cookieAssignMu.Lock()
+	defer cookieAssignMu.Unlock()
+	if relay == "" {
+		delete(cookieRelayAssigned, slot)
+		return
+	}
+	cookieRelayAssigned[slot] = relay
+}
+
+// cookieAssigned: a copy of the reservations, read under cookieAssignMu for
+// a moment — what the minter decides by (under cookieMu, so two mints never
+// decide at once; the pool's placement re-checks the truth under cp.mu).
+func cookieAssigned() map[int]string {
+	cookieAssignMu.Lock()
+	defer cookieAssignMu.Unlock()
+	out := make(map[int]string, len(cookieRelayAssigned))
+	for s, a := range cookieRelayAssigned {
+		out[s] = a
+	}
+	return out
 }
 
 func cookieLinks() []string {
@@ -144,7 +185,22 @@ func cookieLinkID(s string) string {
 // or fewer than 2 per call. If there are fewer distinct relays than slot+1, the
 // slot is left unfilled with a clear error (instead of a 486 collision). Mints
 // are cached per link and re-minted near expiry. NO captcha.
-func cookieCredForSlot(ctx context.Context, slot int) (*TURNCreds, error) {
+//
+// With a TURN override list (2026-10-19) the slots are made of the LIST
+// instead: slot s → its s-th relay, each its own (okcdn_userid, relay) quota —
+// any VK credential works on any VK relay (measured) — and a list shorter than
+// the slots asked for leaves the rest unfilled, as a short relay set does.
+//
+// `held` (2026-10-20) is what the pool already holds on its OTHER slots —
+// loaded from disk, seeded by the app, minted earlier — and is never handed
+// to this slot: the discovery list knows only this process's mints, and a
+// slot loaded from the previous run (the user's run 9: slot 2 on a relay the
+// mint then returned for slot 8 — one user id, one quota, 486 on the second)
+// or the app's seed are not in it. A slot keeps the relay it was given while
+// no other slot holds it (`cookieRelayAssigned`); the s-th distinct relay is
+// still preferred when it is free, so a pool minted from scratch is shaped
+// as before. Nothing free: the slot is left unfilled, the message says why.
+func cookieCredForSlot(ctx context.Context, slot int, override []string, held []string, avoid []string) (*TURNCreds, error) {
 	ch := vkCookieHeader()
 	if ch == "" {
 		return nil, fmt.Errorf("no VK cookie stored: %w", ErrCookieRejected)
@@ -157,12 +213,144 @@ func cookieCredForSlot(ctx context.Context, slot int) (*TURNCreds, error) {
 		slot = 0
 	}
 
+	heldSet := make(map[string]bool, len(held))
+	for _, a := range held {
+		if a != "" {
+			heldSet[a] = true
+		}
+	}
+	// free: not held by another slot of the pool, not handed to another slot
+	// in this process (two mints in flight must not take one relay). The
+	// reservations read under cookieAssignMu (cookieAssigned), the decision
+	// under cookieMu.
+	free := func(addr string) bool {
+		if heldSet[addr] {
+			return false
+		}
+		for s, a := range cookieAssigned() {
+			if a == addr && s != slot {
+				return false
+			}
+		}
+		return true
+	}
+
+	// The list in cookie mode (turnOverride.cookieShape): the FIXED entries
+	// take the slots 0..m-1; `$vkurls` takes every slot from m on — VK's
+	// distinct relays, the discovery below with the slot counted from m.
+	fixed, vkTail := (turnOverride{servers: override}).cookieShape()
+	vslot := slot
 	cookieMu.Lock()
 	defer cookieMu.Unlock()
+	if len(override) > 0 {
+		if slot >= len(fixed) && !vkTail {
+			return nil, fmt.Errorf("cookie auth: the TURN override names %d relay(s) — slot %d unfilled (add relays to the list, or lower Connections)", len(fixed), slot)
+		}
+		if slot >= len(fixed) {
+			vslot = slot - len(fixed)
+			for _, a := range fixed {
+				heldSet[a] = true // a fixed entry is a fixed slot's, whoever VK hands it to
+			}
+		}
+	}
+	if len(override) > 0 && slot < len(fixed) {
+		override := fixed
+		// The slot's entry: the one it was given before while the list still
+		// names it and no other slot holds it, else its own index's, else the
+		// first free — never one another slot holds (the user's review of 454:
+		// a list resolved in another order made the index a twin of the slot
+		// whose ten leases sit on that relay). None free: unfilled.
+		relay := ""
+		inList := func(a string) bool {
+			for _, o := range override {
+				if o == a {
+					return true
+				}
+			}
+			return false
+		}
+		// freeIn: free, and a reservation held by a slot BEYOND the list
+		// reserves nothing — that slot dials nothing (the user's review of
+		// 455: the list shrunk, slot 1's old reservation of B kept slot 0's
+		// mint from B).
+		freeIn := func(addr string) bool {
+			if heldSet[addr] {
+				return false
+			}
+			for s, a := range cookieAssigned() {
+				if a == addr && s != slot && s < len(override) {
+					return false
+				}
+			}
+			return true
+		}
+		switch a := cookieAssigned()[slot]; {
+		case a != "" && inList(a) && freeIn(a):
+			relay = a
+		case freeIn(override[slot]):
+			relay = override[slot]
+		default:
+			for _, o := range override {
+				if freeIn(o) {
+					relay = o
+					break
+				}
+			}
+		}
+		if relay == "" {
+			return nil, fmt.Errorf("cookie auth: the TURN override names %d relay(s), every one held by another slot — slot %d unfilled (add relays to the list, or lower Connections)", len(override), slot)
+		}
+		cookieNoteSlotRelay(slot, relay)
+		creds, err := cookieMintCachedLocked(ctx, links[slot%len(links)], ch)
+		if err != nil {
+			return nil, err
+		}
+		return &TURNCreds{Username: creds.Username, Password: creds.Password, Address: relay, Addresses: []string{relay}}, nil
+	}
+	byAddr := func(addr string) (cookieRelayRef, bool) {
+		for _, ref := range cookieRelayList {
+			if ref.address == addr {
+				return ref, true
+			}
+		}
+		return cookieRelayRef{}, false
+	}
+	// avoid: relays whose quota clock runs in the pool (quarantined) — another
+	// distinct relay is preferred, one of these taken only when nothing else is
+	// free (the user's runs 6–7 of 2026-10-30: a fresh mint onto a relay used
+	// minutes ago parked for the rest of the window).
+	avoidSet := make(map[string]bool, len(avoid))
+	for _, a := range avoid {
+		avoidSet[a] = true
+	}
+	pickWith := func(ok func(string) bool) (cookieRelayRef, bool) {
+		if a, got := cookieAssigned()[slot]; got && ok(a) {
+			if ref, got := byAddr(a); got {
+				return ref, true
+			}
+		}
+		if vslot < len(cookieRelayList) && ok(cookieRelayList[vslot].address) {
+			return cookieRelayList[vslot], true
+		}
+		for _, ref := range cookieRelayList {
+			if ok(ref.address) {
+				return ref, true
+			}
+		}
+		return cookieRelayRef{}, false
+	}
+	pick := func() (cookieRelayRef, bool) {
+		if ref, ok := pickWith(func(a string) bool { return free(a) && !avoidSet[a] }); ok {
+			return ref, true
+		}
+		return pickWith(free)
+	}
 
-	// Discover distinct relays lazily until we have more than `slot` of them, or
-	// every call link has been minted (no more relays to find).
-	for len(cookieRelayList) <= slot && cookieDiscoverIdx < len(links) {
+	// Discover distinct relays lazily until the slot's own (the s-th) is known
+	// and something is free, or every call link has been minted (no more
+	// relays to find).
+	ref, ok := pick()
+	for (len(cookieRelayList) <= vslot || !ok) && cookieDiscoverIdx < len(links) {
 		linkID := links[cookieDiscoverIdx]
 		cookieDiscoverIdx++
 		creds, err := cookieMintCachedLocked(ctx, linkID, ch)
@@ -175,12 +363,13 @@ func cookieCredForSlot(ctx context.Context, slot int) (*TURNCreds, error) {
 				cookieRelayList = append(cookieRelayList, cookieRelayRef{address: addr, linkID: linkID})
 			}
 		}
+		ref, ok = pick()
 	}
-	if slot >= len(cookieRelayList) {
-		return nil, fmt.Errorf("cookie auth: only %d distinct TURN relay(s) from %d call link(s) — slot %d unfilled (add more/different calls, or lower Connections)", len(cookieRelayList), len(links), slot)
+	if !ok {
+		return nil, fmt.Errorf("cookie auth: only %d distinct TURN relay(s) from %d call link(s), %d held by other slots — slot %d unfilled (add more/different calls, or lower Connections)", len(cookieRelayList), len(links), len(heldSet), slot)
 	}
+	cookieNoteSlotRelay(slot, ref.address)
 
-	ref := cookieRelayList[slot]
 	creds, err := cookieMintCachedLocked(ctx, ref.linkID, ch)
 	if err != nil {
 		return nil, err
@@ -191,6 +380,31 @@ func cookieCredForSlot(ctx context.Context, slot int) (*TURNCreds, error) {
 		Address:   ref.address,
 		Addresses: []string{ref.address},
 	}, nil
+}
+
+// cookieSeedCred is the app's probe in cookie mode: slot 0's credential as
+// cookieCredForSlot gives it — and with it EVERY relay VK named for that call.
+// cookieCredForSlot cuts a mint to the slot's one relay (a slot IS a relay),
+// so the probe's answer named one relay, the app's seed carried one, and a cold
+// pool had nowhere to go from it without asking VK again — while the mint the
+// probe had just paid for named the others. The list goes back to the app in
+// turn_addresses, returns in seeded_turn.addresses, and the pool makes the
+// further relays slots of the seed's credential (credPool.seedSiblingsLocked).
+// The credential's own relay stands first. The list is taken from the cached
+// mint this very credential came from (its username) — never another call's.
+func cookieSeedCred(ctx context.Context) (*TURNCreds, error) {
+	creds, err := cookieCredForSlot(ctx, 0, nil, nil, nil)
+	if err != nil {
+		return nil, err
+	}
+	cookieMu.Lock()
+	defer cookieMu.Unlock()
+	for _, cc := range cookieCache {
+		if cc != nil && cc.creds != nil && cc.creds.Username == creds.Username {
+			creds.Addresses = dedupeAddrs(append([]string{creds.Address}, cc.creds.Addresses...))
+		}
+	}
+	return creds, nil
 }
 
 // cookieMintCachedLocked returns the cached (or freshly minted) multi-relay cred

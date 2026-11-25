@@ -189,13 +189,13 @@ func TestAHerdOfInstantFailuresIsBoundedByTheFloor(t *testing.T) {
 	var dials atomic.Int64
 	p := &Proxy{ctx: ctx, credPool: cp}
 	p.sessionHook = func(_ context.Context, connIdx int) error {
-		_, creds, slot, err := p.resolveTURNAddr(connIdx, false)
+		_, creds, slot, _, err := p.resolveTURNAddr(context.Background(), connIdx, false)
 		if err != nil {
 			return err // a park: the pool's own answer, no floor
 		}
 		dials.Add(1)
 		time.Sleep(time.Millisecond) // the seat is held for the length of a failing connect()
-		p.credPool.release(slot, creds)
+		p.credPool.release(slot, creds, "")
 		return errors.New("SRTP setup: TURN dial: dial tcp 203.0.113.11:19302: connect: no route to host")
 	}
 
@@ -376,7 +376,7 @@ func TestTheRetryWaitsConsultTheFloor(t *testing.T) {
 		t.Error("the direct session's \"established\" line carries the session-up stamp — that line precedes the allocation and is evidence of nothing")
 	}
 	turn := goFuncBody(t, "proxy.go", "func (p *Proxy) runTURN(")
-	alloc, stamp := strings.Index(turn, "p.credPool.noteAllocated(slotIdx, creds)"), strings.Index(turn, "p.noteSessionUp(connIdx)")
+	alloc, stamp := strings.Index(turn, "p.relayAllocatedAt(slotIdx, creds, turnAddr, attempt)"), strings.Index(turn, "p.noteSessionUp(connIdx)")
 	if alloc < 0 || stamp < alloc || !strings.Contains(turn[alloc:stamp], "if p.directMode() {") {
 		t.Error("runTURN does not stamp the direct mode's session-up at its allocation (under directMode, after the allocation succeeded)")
 	}

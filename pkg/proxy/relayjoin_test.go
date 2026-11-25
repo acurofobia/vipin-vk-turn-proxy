@@ -13,6 +13,7 @@ package proxy
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -245,17 +246,17 @@ func TestASessionReturnsOnlyAfterItsRelayLegIsTornDown(t *testing.T) {
 		}
 		s.verdict(t, "runWrapASession (early exit)", time.Since(t0))
 	})
-	t.Run("runWrapASession — an early return that nobody cancelled: the WRAP-A layer cannot be built", func(t *testing.T) {
-		s, _ := newRelayJoinStand(t, Config{UseWrapA: true, WrapAPassword: "stand", DeviceID: "stand"}, silentPeer(t))
-		s.p.wrapAKey = s.p.wrapAKey[:1] // the session returns right behind the relay leg's start, its context alive
+	t.Run("runWrapASession rejects an invalid key before opening a relay leg", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		p := &Proxy{wrapAKey: []byte{0}, credPool: newCredPool(ctx, 1, time.Second, "", func(bool, int) (string, *TURNCreds, error) {
+			t.Error("invalid local setup reached relay lookup")
+			return "", nil, errors.New("unexpected relay lookup")
+		})}
 		signaled := false
-		t0 := time.Now()
-		if err := s.p.runWrapASession(context.Background(), "", nil, &signaled, 0); err == nil {
-			t.Fatal("fixture: the WRAP-A session did not fail at its init")
-		}
-		s.verdict(t, "runWrapASession (init failure)", time.Since(t0))
-		if n := s.p.dealloc.legsLeft.Load(); n != 0 {
-			t.Errorf("the session returned WITHOUT its relay leg (%d): nobody ended the leg of a session that returned by itself", n)
+		err := p.runWrapASession(ctx, "", nil, &signaled, 0)
+		if err == nil || !strings.HasPrefix(err.Error(), "WRAP-A init:") {
+			t.Fatalf("expected local init failure, got %v", err)
 		}
 	})
 	t.Run("runDirectSession — the session IS the relay leg", func(t *testing.T) {
@@ -510,7 +511,7 @@ func TestEverySessionJoinsItsRelayLegBeforeItGivesItsCredentialBack(t *testing.T
 		sessions++
 		first := strings.Index(b, "p.goRunTURN(")
 		joinAt := strings.Index(b, "defer p.joinRelayLeg(&leg, connCancel, connIdx)")
-		release := strings.Index(b, "p.releaseLease(currentSlot, currentCreds, &leg.gave)") // the lease's release — behind the relay's second since 430, seatcool.go
+		release := strings.Index(b, "p.releaseLease(currentSlot, currentCreds, currentAddr, &leg.gave)") // the lease's release — behind the relay's second since 430, seatcool.go
 		switch {
 		case strings.Count(b, "defer p.joinRelayLeg(") != 1 || joinAt < 0:
 			t.Errorf("%s starts a relay leg and does not defer joinRelayLeg(&leg, connCancel, connIdx) exactly once", fn)

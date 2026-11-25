@@ -130,7 +130,7 @@ func TestSummaryOverRealSockets(t *testing.T) {
 		t.Errorf("summary %q reports retransmits on the FIRST sample — the "+
 			"baseline is being subtracted from nothing", out)
 	}
-	s.unregister(1)
+	s.unregister(1, s.conns[1])
 	if out2 := s.summary(); !strings.Contains(out2, "sock=2") {
 		t.Errorf("after unregister, summary = %q, want sock=2", out2)
 	}

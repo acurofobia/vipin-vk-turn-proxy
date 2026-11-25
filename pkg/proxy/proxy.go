@@ -36,8 +36,9 @@ import (
 // Config holds proxy configuration.
 type Config struct {
 	PeerAddr         string        // vk-turn-proxy server address (host:port)
-	TurnServer       string        // override TURN server host (optional)
+	TurnServer       string        // override TURN server host (optional; the older pair — TurnServers wins when set)
 	TurnPort         string        // override TURN port (optional)
+	TurnServers      []string      // override TURN relays, host:port each, or TURNServersVK for VK's own in its place: replaces VK's addresses for EVERY credential, cached ones included (relayhealth.go)
 	VKLink           string        // VK call invite link or link ID
 	UseDTLS          bool          // true = DTLS obfuscation (default mode)
 	UseUDP           bool          // true = UDP to TURN, false = TCP
@@ -143,6 +144,19 @@ type Config struct {
 	// record on every SRTP-WRAP-S stream (server allowlist key; read+ignored
 	// unless the server runs -clients-file). Only used when UseWrapS.
 	ClientID string
+
+	// GOMAXPROCS is the scheduler thread count Start sets. 0 = 2, the iOS
+	// extension's setting (its CPU wake-up budget — see Start). A console on a
+	// desktop has no such budget and up to 120 connections of crypto: > 0 sets
+	// that many, < 0 leaves Go's default (every core) alone.
+	GOMAXPROCS int
+
+	// CredPoolSize replaces the credential pool's size in ANONYMOUS mode; 0 =
+	// poolSizeForNumConns, the app's four identities per ten connections —
+	// three reserve sets, because a path change cools every identity in use and
+	// a phone switches networks often. Cookie mode keeps its one slot per relay
+	// whatever this says: the relays are a finite set.
+	CredPoolSize int
 }
 
 // Stats holds live tunnel statistics.
@@ -175,6 +189,10 @@ type Proxy struct {
 
 	peer   *net.UDPAddr
 	linkID string
+
+	// Per-instance test overrides set before starting sessions. Zero uses the default.
+	dtlsHandshakeTimeout time.Duration
+	srtpHandshakeTimeout time.Duration
 
 	// For packet I/O from the WireGuard side. sendCh carries a sendItem rather
 	// than a bare []byte so each packet's enqueue instant travels WITH it —
@@ -278,10 +296,13 @@ type Proxy struct {
 	// the epoch each running session stamped at its start and the cancel that
 	// restarts it, both under connMu so a restart never hits a session that
 	// started after its epoch.
-	connMu      sync.Mutex
-	connEpoch   []int64
-	connCancel  []func()
-	pathRestart pathRestart
+	connMu       sync.Mutex
+	connEpoch    []int64
+	connCancel   []func()
+	connRelay    []string // the relay each connection was handed at resolveTURNAddr; "" between sessions (relaymarkend.go)
+	connRelaySeq []uint64 // the hand-out's stamp (the pool's counter at the hand-out, recorded by setConnRelay): a mark's notice ends only sessions handed their relay before it
+	connSerial   []uint64 // the running session's serial per connection (beginConnSession): the row — cancel, relay, stamp — is written and cleared by that session alone (pathrestart.go)
+	pathRestart  pathRestart
 
 	// ups records when sessions came up, per connection and proxy-wide — what
 	// the retry floor asks about (retryfloor.go).
@@ -319,6 +340,9 @@ type Proxy struct {
 	// Watchdog: last time a packet was received (unix seconds).
 	// Used to detect dead tunnels after iOS freeze/thaw.
 	lastRecvTime atomic.Int64
+
+	// Cumulative attempts invalidated by process suspension or a wake callback.
+	handshakeSuspended atomic.Uint64
 
 	// Pion silent-degradation detector. The pion TURN client logs Errorf when
 	// CreatePermission refresh fails and Warnf when ChannelBind refresh fails.
@@ -602,6 +626,9 @@ func NewProxy(cfg Config) *Proxy {
 		lastRxAt:          make([]atomic.Int64, cfg.NumConns),
 		connLocalIPs:      make([]atomic.Value, cfg.NumConns),
 		connEpoch:         make([]int64, cfg.NumConns),
+		connRelay:         make([]string, cfg.NumConns),
+		connRelaySeq:      make([]uint64, cfg.NumConns),
+		connSerial:        make([]uint64, cfg.NumConns),
 		connCancel:        make([]func(), cfg.NumConns),
 		wakeCh:            make(chan struct{}),
 		startedAt:         time.Now(),
@@ -626,16 +653,29 @@ func NewProxy(cfg Config) *Proxy {
 	// VK-supplied expiry timestamp (see parseCredExpiry / credExpiryBuffer
 	// in creds.go) — no separate TTL setting needed.
 	poolSize := poolSizeForNumConns(cfg.NumConns)
+	if cfg.CredPoolSize > 0 {
+		poolSize = cfg.CredPoolSize // the console's reserve sets (Config.CredPoolSize)
+	}
 	if cookieAuthEnabled.Load() {
 		// Cookie (VKAuth) mode: one slot per relay (2 per call link), no 4×
 		// reserve — the relays are a finite set, so extra slots would just
-		// duplicate a relay and 486. See cookieCredForSlot.
+		// duplicate a relay and 486. See cookieCredForSlot. The list's fixed
+		// entries are added by setOverride below (growForListLocked).
 		if n := len(cookieLinks()); n > 0 {
 			poolSize = 2 * n
 		}
 	}
 	p.credPool = newCredPool(ctx, poolSize, cfg.CredPoolCooldown, cfg.CredCachePath, p.fetchFreshCreds)
 	p.credPool.setColdStartTarget(cfg.NumConns)
+	// A relay the pool marks UNREACHABLE ends the sessions still on it
+	// (relaymarkend.go); the pool calls this outside its lock.
+	p.credPool.onRelayMarked = func(addr string, stamp uint64) { p.endSessionsOnRelay(addr, stamp) }
+	// The TURN override is applied when a credential is HANDED OUT, to every
+	// credential — the cache's included (issue #102: an override that did not
+	// reach a cached credential kept the client on a dead relay).
+	// A DNS name in the list is resolved HERE, before the pool keys anything on
+	// it (issue #105) — from the app's pre-resolved map first.
+	p.credPool.setOverride(turnOverride{servers: ResolveTURNServers(ctx, cfg.TurnServers, resolvedVKHostIPs), raw: cfg.TurnServers, host: cfg.TurnServer, port: cfg.TurnPort})
 
 	p.initGroupHello(cfg)
 
@@ -644,22 +684,32 @@ func NewProxy(cfg Config) *Proxy {
 	// call, dodging the .connecting-window captcha deadlock.
 	if cfg.SeededTURN != nil {
 		// The seed comes from the main app's pre-bootstrap — either a
-		// disk-cached cred or a fresh probe. Its address is used VERBATIM: the
-		// TurnServer/TurnPort override does NOT apply here. The override only
-		// rewrites fresh VK fetches in fetchFreshCreds; a disk-cached seed
-		// keeps its stored address (the "setting must not affect cached creds"
-		// guarantee), and a fresh probe-seed is already overridden Swift-side
-		// before it reaches here.
-		turnHost, _, err := net.SplitHostPort(cfg.SeededTURN.Address)
-		if err == nil {
+		// disk-cached cred or a fresh probe. Its address is VK's (or the one
+		// the app chose); the TURN override applies to it as to every
+		// credential when it is handed out (credpool_relay.go) — since
+		// 2026-10-19 the setting DOES reach a cached credential.
+		if _, _, err := net.SplitHostPort(cfg.SeededTURN.Address); err == nil {
 			p.credPool.seedSlot(0, cfg.SeededTURN.Address, cfg.SeededTURN)
-			p.turnServerIP.Store(turnHost)
+			if host, ok := relayHostToPublish(cfg.SeededTURN.Address); ok {
+				p.turnServerIP.Store(host)
+			}
 		} else {
 			log.Printf("NewProxy: SeededTURN address %q is not host:port (%v) — ignoring", cfg.SeededTURN.Address, err)
 		}
 	}
 
 	return p
+}
+
+// applyGOMAXPROCS is Start's thread count: 0 → 2 (the app), > 0 → n, < 0 →
+// Go's own default left in place (Config.GOMAXPROCS).
+func applyGOMAXPROCS(n int) {
+	switch {
+	case n == 0:
+		runtime.GOMAXPROCS(2)
+	case n > 0:
+		runtime.GOMAXPROCS(n)
+	}
 }
 
 // signalBootstrapDone fires the bootstrap-ready channel exactly once per
@@ -744,7 +794,7 @@ func (p *Proxy) Start() error {
 	// With 10 connections and ~50 goroutines, unrestricted GOMAXPROCS
 	// causes ~1500 wakes/sec. Limiting to 2 threads keeps us well under.
 	if runtime.GOOS == "darwin" {
-		runtime.GOMAXPROCS(2)
+		applyGOMAXPROCS(p.config.GOMAXPROCS)
 	}
 
 	// p.linkID is fixed in NewProxy (parseVKLinkID) and never written here:
@@ -1010,6 +1060,13 @@ func (p *Proxy) startConnections() error {
 	// firing slightly after our calculated deadline (re-arms, scheduler
 	// jitter, etc). Empirically a few seconds is plenty.
 	const allSaturatedWaitSafety = 5 * time.Second
+	// The bootstrap: conn 0 is brought up ALONE, and the pool is told so for
+	// its whole length — a due peer recovery check is not handed to the one
+	// connection every other waits for (credPool.bootstrap). It ends
+	// where conn 0's attempts end, BEFORE the other connections are started
+	// (they take the check as before), and on every way out of this function.
+	boot := p.credPool.bootstrap()
+	defer boot.end()
 	err := spawnConn0()
 	for attempt := 1; err != nil && attempt < maxBootstrapAttempts; attempt++ {
 		var captchaErr *CaptchaRequiredError
@@ -1080,6 +1137,7 @@ func (p *Proxy) startConnections() error {
 			log.Printf("proxy: bootstrap attempt %d/%d succeeded", attempt+1, maxBootstrapAttempts)
 		}
 	}
+	boot.end()
 
 	if err != nil {
 		// Diagnostic: when bootstrap exhausts because pool has zero
@@ -1189,11 +1247,11 @@ func (p *Proxy) waitCaptchaAndRestart() {
 			// creating a self-amplifying decay loop. credPool.get below
 			// returns cached cred if available, otherwise fetches with
 			// allowCaptchaBlock=false (surfaces captcha as error w/o blocking).
-			_, probeCreds, probeSlot, probeErr := p.resolveTURNAddr(-1, false)
+			probeAddr, probeCreds, probeSlot, _, probeErr := p.resolveTURNAddr(context.Background(), -1, false) // no session: nothing is recorded for -1
 			// Probe is non-consuming; release whatever slot got acquired so
 			// it doesn't leak quota count for a cred we never used.
 			if probeErr == nil {
-				p.credPool.release(probeSlot, probeCreds)
+				p.credPool.release(probeSlot, probeCreds, probeAddr)
 				log.Printf("proxy: VK no longer requires captcha (probe succeeded), resuming")
 				p.captchaImageURL.Store("")
 				p.Resume()
@@ -2140,7 +2198,8 @@ func (p *Proxy) runConnection(sessCtx context.Context, linkID string, readyCh ch
 		// restart this conn alone (pathrestart.go) while Pause/Resume keep
 		// cancelling everything through the parent.
 		connCtx, connCancel := context.WithCancel(sessCtx)
-		p.beginConnSession(connIdx, connCancel)
+		serial := p.beginConnSession(connIdx, connCancel)
+		connCtx = withConnSerial(connCtx, serial) // the session's registration is its own to write and clear (pathrestart.go)
 		var err error
 		switch {
 		case p.sessionHook != nil: // a test seam, nil in production
@@ -2165,6 +2224,15 @@ func (p *Proxy) runConnection(sessCtx context.Context, linkID string, readyCh ch
 		established := p.ups.since(connIdx, start)
 		if established {
 			floor.reset()
+			// … and the run of SHORT failures: "consecutive" ends at a session
+			// that came up, however it ended. The count was reset only by a
+			// path change, a dormancy, or an ERROR behind five minutes — and a
+			// session that ran returns nil (a kill, a restart), so failures a
+			// whole session apart added up: a phone, 2026-11-18 — a connection
+			// whose third set-up failure of the run came behind a twelve-minute
+			// session slept 35 s ("3 consecutive short failures") while the
+			// other thirty-nine carried the tunnel.
+			shortFailures = 0
 		}
 		// A restart WE asked for (a path-up) ended this session, not the
 		// path: no failure count, no dormancy, a sub-second stagger so the
@@ -2172,7 +2240,7 @@ func (p *Proxy) runConnection(sessCtx context.Context, linkID string, readyCh ch
 		// that announces the new group.
 		asked := connCtx.Err() != nil && sessCtx.Err() == nil && p.ctx.Err() == nil
 		connCancel()
-		p.endConnSession(connIdx)
+		p.endConnSession(connIdx, serial)
 		if asked {
 			log.Printf("proxy: [conn %d] session ended after %s by request (path change) — restarting now",
 				connIdx, time.Since(start).Round(time.Second))
@@ -2323,8 +2391,28 @@ func (p *Proxy) directMode() bool {
 // still don't actively rotate — no demonstrated throughput win — but a
 // relay/serverAddress mismatch is harmless. See
 // evaluated_alternatives_turn_endpoint_rotation.md.
-func (p *Proxy) resolveTURNAddr(connIdx int, allowCaptchaBlock bool) (string, *TURNCreds, int, error) {
-	return p.credPool.get(connIdx, allowCaptchaBlock)
+//
+// The fourth result is the hand-out's stamp — the session's GENERATION, what
+// its replacement sentinel declares (sendGroupHello, tickPing): THIS hand-out's,
+// returned by the pool from under its lock, never read back from the table
+// (the user's review of af80e3c: the table holds the LATEST hand-out on the
+// index, another session's after a Resume or a ForceReconnect). ctx is the
+// session's own (its serial — pathrestart.go), so that a stale session's late
+// hand-out does not overwrite its successor's row.
+func (p *Proxy) resolveTURNAddr(ctx context.Context, connIdx int, allowCaptchaBlock bool) (string, *TURNCreds, int, uint64, error) {
+	addr, creds, slot, stamp, err := p.credPool.handOut(connIdx, allowCaptchaBlock)
+	if err == nil && connIdx >= 0 {
+		// The relay's pace, where the override list gives one, is this
+		// connection's uplink rate from here on and what its hello declares
+		// to the server (uplinkpace.go, groupPaceMagic). The hand-out is the
+		// one place a session learns its relay, on every transport — so it
+		// is also where the proxy records which relay the connection sits
+		// on, for the day the relay is marked dead (relaymarkend.go).
+		kib, has := p.credPool.relayPace(addr)
+		setConnRelayPace(connIdx, kib, has)
+		p.recordHandOut(ctx, connIdx, addr, stamp)
+	}
+	return addr, creds, slot, stamp, err
 }
 
 // wakeChannelFor is the channel a retry parks on after err. A park error
@@ -2358,7 +2446,7 @@ func (p *Proxy) fetchFreshCreds(allowCaptchaBlock bool, slot int) (string, *TURN
 		// conns spread across relays — each (okcdn_userid, relay) is its own ~10
 		// allocation quota (2026-06-28 finding). No captcha bookkeeping here.
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		c, cerr := cookieCredForSlot(ctx, slot)
+		c, cerr := cookieCredForSlot(ctx, slot, p.credPool.overrideServers(), p.credPool.heldRelaysExcept(slot), p.credPool.quarantinedRelays()) // the pool's list, resolved (#105)
 		cancel()
 		if cerr != nil {
 			if errors.Is(cerr, ErrCookieRejected) {
@@ -2414,32 +2502,46 @@ func (p *Proxy) fetchFreshCreds(allowCaptchaBlock bool, slot int) (string, *TURN
 		}
 		creds = c
 	} // end else (anonymous path)
-	// Apply the "TURN server" override (Settings → optional turn_server/
-	// turn_port; empty = no override) to every VK-returned address. This is
-	// the fresh-fetch path: the override affects creds RECEIVED FROM VK and
-	// bakes into the cred + on-disk cache (intended). Cached/seeded creds are
-	// used as STORED — the seed path in NewProxy does NOT re-apply the
-	// override (the "setting must not affect cached creds" guarantee). Today
-	// only Addresses[0] is dialed (resolveTURNAddr), but we override all
-	// entries uniformly so a future failover doesn't redo the pass. Addresses
-	// must be non-empty (getVKCredsWithClientID guarantees ≥1).
-	for i, vkAddr := range creds.Addresses {
-		h, pport, perr := net.SplitHostPort(vkAddr)
-		if perr != nil {
+	// The credential keeps VK's own addresses — ALL of them, into the pool
+	// and the on-disk cache. The "TURN server" override is no longer baked in
+	// here: the pool applies it when the credential is handed out, to cached
+	// credentials too (credpool_relay.go, issue #102); and the relay a session
+	// is on is chosen there as well, by the relay health (relayhealth.go) —
+	// TURNServerIP is set at the allocation, from the relay that answered.
+	if len(creds.Addresses) == 0 {
+		if creds.Address == "" {
+			return "", nil, errors.New("VK returned no TURN address")
+		}
+		creds.Addresses = []string{creds.Address}
+	}
+	for _, vkAddr := range creds.Addresses {
+		if _, _, perr := net.SplitHostPort(vkAddr); perr != nil {
 			return "", nil, fmt.Errorf("parse TURN address %q: %w", vkAddr, perr)
 		}
-		if p.config.TurnServer != "" {
-			h = p.config.TurnServer
-		}
-		if p.config.TurnPort != "" {
-			pport = p.config.TurnPort
-		}
-		creds.Addresses[i] = net.JoinHostPort(h, pport)
 	}
 	creds.Address = creds.Addresses[0]
-	firstHost, _, _ := net.SplitHostPort(creds.Addresses[0])
-	p.turnServerIP.Store(firstHost)
 	return creds.Addresses[0], creds, nil
+}
+
+// relayUnanswered is the relay leg's way out on an Allocate that got NO
+// answer: the pool hears which relay, which credential and when the attempt
+// began (relayhealth.go decides whether that marks the relay), the error
+// goes back as it is. Any other error passes through untouched.
+func (p *Proxy) relayUnanswered(connIdx, slot int, creds *TURNCreds, turnAddr string, attempt time.Time, err error) error {
+	if isRelayUnanswered(err) {
+		p.credPool.noteRelayFailure(connIdx, slot, creds, turnAddr, attempt, !pathSpoke(err))
+	}
+	return err
+}
+
+// relayAllocatedAt: the relay at turnAddr accepted the credential — the pool's
+// quota mark and the relay health's evidence, and the host the app's next
+// connect names as serverAddress (TURNServerIP).
+func (p *Proxy) relayAllocatedAt(slot int, creds *TURNCreds, turnAddr string, attempt time.Time) {
+	p.credPool.noteAllocatedAt(slot, creds, turnAddr, attempt)
+	if host, ok := relayHostToPublish(turnAddr); ok { // an IP or nothing: iOS refuses a name as the tunnel's address (#105)
+		p.turnServerIP.Store(host)
+	}
 }
 
 // runDTLSSession runs a long-lived DTLS session.
@@ -2474,7 +2576,7 @@ func (p *Proxy) runDTLSSession(sessCtx context.Context, linkID string, readyCh c
 	// the first such waiter started in mid-session). Bootstrap captcha is
 	// handled separately at runConnection's level via waitCaptchaAndRestart
 	// + captchaWaiterActive guard, before we ever reach this code.
-	turnAddr, creds, credSlot, err := p.resolveTURNAddr(connIdx, false)
+	turnAddr, creds, credSlot, sessGen, err := p.resolveTURNAddr(sessCtx, connIdx, false)
 	if err != nil {
 		return err
 	}
@@ -2487,13 +2589,14 @@ func (p *Proxy) runDTLSSession(sessCtx context.Context, linkID string, readyCh c
 	// the PAIR — the slot and the credential it handed out: the slot may be
 	// refilled under us, and the pool counts a release only against the
 	// credential it names (credPool.release).
-	currentSlot, currentCreds := credSlot, creds
+	currentSlot, currentCreds, currentAddr := credSlot, creds, turnAddr
 	// The relay leg this session starts below. It also carries the note of the
 	// allocation given back, by which the lease is released behind the relay's
 	// second (relayjoin.go, seatcool.go).
 	var leg relayLeg
+	leg.ready = make(chan struct{})
 	leg.gave.watch(connCancel, connIdx, p.config.UseUDP) // a session dead at the relay is ended at once — outofreach.go
-	defer func() { p.releaseLease(currentSlot, currentCreds, &leg.gave) }()
+	defer func() { p.releaseLease(currentSlot, currentCreds, currentAddr, &leg.gave) }()
 
 	// Start TURN relay FIRST — DTLS handshake goes through it.
 	// TURN runs until it fails naturally (no forced lifetime).
@@ -2522,7 +2625,7 @@ func (p *Proxy) runDTLSSession(sessCtx context.Context, linkID string, readyCh c
 	// The relay leg runs in a goroutine of its own and is JOINED before this
 	// session returns (relayjoin.go). On its exit it always cancels the session:
 	// without TURN there's no DTLS transport, so the conn is dead either way.
-	turnDone, _ := p.goRunTURN(connCtx, &leg, turnAddr, creds, conn2, connIdx, credSlot, connCancel)
+	turnDone, _ := p.goRunTURN(connCtx, &leg, turnAddr, creds, conn2, connIdx, credSlot, sessGen, connCancel)
 	// Registered BEHIND the credential's release above, so it runs BEFORE it, and
 	// ahead of every return below — the early ones too: the session gives its
 	// credential back, and its connection re-dials, only after the relay leg's
@@ -2530,8 +2633,16 @@ func (p *Proxy) runDTLSSession(sessCtx context.Context, linkID string, readyCh c
 	defer p.joinRelayLeg(&leg, connCancel, connIdx)
 
 	// DTLS handshake — packets go through conn1 → conn2 → TURN relay → peer
+	// Start its deadline only after the TURN leg has permission to send.
+	select {
+	case <-leg.ready:
+	case <-connCtx.Done():
+	}
 	dtlsStart := time.Now()
-	dtlsConn, err := dialDTLS(connCtx, conn1, p.peer)
+	wakeEpoch := p.wakeEpoch.Load()
+	dtlsConn, err, observation := p.dialDTLS(connCtx, conn1)
+	observation.suspended = observation.suspended || p.wakeEpoch.Load() != wakeEpoch
+	p.notePeerHandshake(sessCtx, connIdx, sessGen, turnAddr, observation, err)
 	if err != nil {
 		connCancel()
 		select {
@@ -2552,7 +2663,7 @@ func (p *Proxy) runDTLSSession(sessCtx context.Context, linkID string, readyCh c
 					// path-change like vpn.wifi-lte-wifi.1.log). It logs
 					// its own decision; here we only log the proxy-side
 					// context (which conn, which slot).
-					cooldown := p.credPool.markSaturated(credSlot, creds)
+					cooldown := p.credPool.markSaturated(credSlot, creds, turnAddr)
 					log.Printf("proxy: [conn %d] TURN allocate quota error (486) on slot %d (cooldown %s)",
 						connIdx, credSlot, cooldown.Round(time.Second))
 				} else if isAuthError(turnErr) {
@@ -2635,7 +2746,14 @@ func (p *Proxy) runDTLSSession(sessCtx context.Context, linkID string, readyCh c
 	// rebuilds the conn with a fresh TURN allocation. See proxy
 	// struct comment on serverProbeable / lastPongTimes for full
 	// rationale.
+	//
+	// Joined by the session before it returns (joinPingLoop, wakeprobe.go):
+	// the goroutine leaves on connCtx at its own time, and a session that
+	// returned without it left it reading the probe's state behind the
+	// session's back (the gate's fixture race, 2026-11-03).
+	pingDone := make(chan struct{})
 	go func() {
+		defer close(pingDone)
 		ticker := time.NewTicker(probeInterval)
 		defer ticker.Stop()
 		var seq uint64
@@ -2664,7 +2782,7 @@ func (p *Proxy) runDTLSSession(sessCtx context.Context, linkID string, readyCh c
 		// a probeInterval of that is a probeInterval of the old, skewed
 		// downlink at the start of every tunnel. Re-sent on every tick so a
 		// lost hello heals by repetition and a restarted server re-groups us.
-		p.sendGroupHello(dtlsConn)
+		p.sendGroupHello(dtlsConn, connIdx, sessGen)
 		// Tick-gap detector: if the gap between two consecutive ticks is
 		// much larger than probeInterval, our goroutine was suspended
 		// (iOS Network Extension freeze). During that time we couldn't
@@ -2722,12 +2840,15 @@ func (p *Proxy) runDTLSSession(sessCtx context.Context, linkID string, readyCh c
 				lastTickAt = now
 				// The tick's ping is ONE body for both session kinds — seq and the stamp a
 				// wake probe may adopt it by move together there (tickPing, wakeprobe.go).
-				if err := p.tickPing(&seq, &lastPingAt, now, sendPing); err != nil {
-					// Write failure means the conn is already broken.
-					// Other goroutines (DTLS recv timeout, TURN reconnect
-					// loop) will handle the actual teardown — we just
-					// stop sending probes.
-					return
+				if err := p.tickPing(&seq, &lastPingAt, now, sendPing, dtlsConn, connIdx, sessGen); err != nil {
+					// ONE verdict for both session kinds (pingWriteFailed, wakeprobe.go,
+					// build 469): the connection gone ends the session here; any other
+					// error leaves the goroutine — and the zombie detector below — alive.
+					// 🚫 Never a bare return here: up to 468 it took the detector with
+					// it, and nobody else ends a dead connection on an idle phone.
+					if p.pingWriteFailed(connCtx, connIdx, credSlot, "", err, connCancel) {
+						return
+					}
 				}
 				// Zombie check: if no pong for probeStaleThreshold (default
 				// 120s) AND the server has been observed responding to at
@@ -2798,7 +2919,13 @@ func (p *Proxy) runDTLSSession(sessCtx context.Context, linkID string, readyCh c
 				// both session kinds — wakeWatch.serve, wakeprobe.go (builds 422–424).
 				alive, probed, err := wake.serve(connCtx, connIdx, credSlot, "", &seq, &lastPingAt, sendPing)
 				if err != nil {
-					return
+					// The probe's own ping failed: the one verdict (pingWriteFailed). A
+					// failure that is not the connection's leaves the wake pending — the
+					// next turn of the loop serves it again, under the probe's own throttle.
+					if p.pingWriteFailed(connCtx, connIdx, credSlot, "", err, connCancel) {
+						return
+					}
+					continue
 				}
 				if !alive {
 					connCancel()
@@ -2812,6 +2939,8 @@ func (p *Proxy) runDTLSSession(sessCtx context.Context, linkID string, readyCh c
 			}
 		}
 	}()
+
+	defer p.joinPingLoop(connCancel, pingDone, connIdx, "")
 
 	// Bidirectional forwarding: sendCh ↔ dtlsConn (long-lived)
 	var wg sync.WaitGroup
@@ -3005,24 +3134,24 @@ func (p *Proxy) runDirectSession(sessCtx context.Context, linkID string, readyCh
 	})
 
 	// allowCaptchaBlock=false — see runDTLSSession's matching comment.
-	turnAddr, creds, credSlot, err := p.resolveTURNAddr(connIdx, false)
+	turnAddr, creds, credSlot, sessGen, err := p.resolveTURNAddr(sessCtx, connIdx, false)
 	if err != nil {
 		return err
 	}
 	// The lease is the pair (slot, credential) — see runDTLSSession.
-	currentSlot, currentCreds := credSlot, creds
+	currentSlot, currentCreds, currentAddr := credSlot, creds, turnAddr
 	// The relay leg this session starts below. It also carries the note of the
 	// allocation given back, by which the lease is released behind the relay's
 	// second (relayjoin.go, seatcool.go).
 	var leg relayLeg
 	leg.gave.watch(connCancel, connIdx, p.config.UseUDP) // a session dead at the relay is ended at once — outofreach.go
-	defer func() { p.releaseLease(currentSlot, currentCreds, &leg.gave) }()
+	defer func() { p.releaseLease(currentSlot, currentCreds, currentAddr, &leg.gave) }()
 
 	// The relay leg IS this session's transport; it is JOINED before the session
 	// returns — behind the credential's release above, so ahead of it
 	// (relayjoin.go). The reconnect loop below starts the next one through the
 	// same leg.
-	turnDone, _ := p.goRunTURN(connCtx, &leg, turnAddr, creds, conn2, connIdx, credSlot, nil)
+	turnDone, _ := p.goRunTURN(connCtx, &leg, turnAddr, creds, conn2, connIdx, credSlot, sessGen, nil)
 	defer p.joinRelayLeg(&leg, connCancel, connIdx)
 
 	if readyCh != nil && !*signaled {
@@ -3062,16 +3191,16 @@ func (p *Proxy) runDirectSession(sessCtx context.Context, linkID string, readyCh
 			// Release before retry loop — see runDTLSSession for full
 			// rationale. Same pattern: avoid stale active counts during
 			// reconnect storm.
-			p.releaseLease(credSlot, currentCreds, &leg.gave) // behind the relay's second, if the leg that ended gave its allocation back
+			p.releaseLease(credSlot, currentCreds, currentAddr, &leg.gave) // behind the relay's second, if the leg that ended gave its allocation back
 			credSlot = -1
-			currentSlot, currentCreds = -1, nil
+			currentSlot, currentCreds, currentAddr = -1, nil, ""
 			retries := 0
 			for retries < 5 {
 				if connCtx.Err() != nil {
 					return
 				}
 				// allowCaptchaBlock=false — see runDTLSSession's matching comment.
-				newAddr, newCreds, newSlot, err := p.resolveTURNAddr(connIdx, false)
+				newAddr, newCreds, newSlot, newGen, err := p.resolveTURNAddr(sessCtx, connIdx, false)
 				if err != nil {
 					retries++
 					select {
@@ -3082,8 +3211,8 @@ func (p *Proxy) runDirectSession(sessCtx context.Context, linkID string, readyCh
 					continue
 				}
 				credSlot = newSlot
-				currentSlot, currentCreds = newSlot, newCreds
-				next, started := p.goRunTURN(connCtx, &leg, newAddr, newCreds, conn2, connIdx, newSlot, nil)
+				currentSlot, currentCreds, currentAddr = newSlot, newCreds, newAddr
+				next, started := p.goRunTURN(connCtx, &leg, newAddr, newCreds, conn2, connIdx, newSlot, newGen, nil)
 				if !started {
 					return // the session is ending: nothing is started behind its join
 				}
@@ -3185,33 +3314,34 @@ func (p *Proxy) runWrapASession(sessCtx context.Context, linkID string, readyCh 
 	defer conn1.Close()
 	defer conn2.Close()
 
-	turnAddr, creds, credSlot, err := p.resolveTURNAddr(connIdx, false)
+	// Validate local framing before the session acquires any relay resources.
+	wrapAPC, err := newWrapAPacketConn(conn1, p.peer, p.wrapAKey)
+	if err != nil {
+		return fmt.Errorf("WRAP-A init: %w", err)
+	}
+
+	turnAddr, creds, credSlot, sessGen, err := p.resolveTURNAddr(sessCtx, connIdx, false)
 	if err != nil {
 		return err
 	}
+	attempt := time.Now() // when this attempt on the relay began — what its success is dated by (peerrefused.go)
 	// The lease is the pair (slot, credential) — see runDTLSSession.
-	currentSlot, currentCreds := credSlot, creds
+	currentSlot, currentCreds, currentAddr := credSlot, creds, turnAddr
 	// The relay leg this session starts below. It also carries the note of the
 	// allocation given back, by which the lease is released behind the relay's
 	// second (relayjoin.go, seatcool.go).
 	var leg relayLeg
 	leg.gave.watch(connCancel, connIdx, p.config.UseUDP) // a session dead at the relay is ended at once — outofreach.go
-	defer func() { p.releaseLease(currentSlot, currentCreds, &leg.gave) }()
+	defer func() { p.releaseLease(currentSlot, currentCreds, currentAddr, &leg.gave) }()
 
 	// TURN relay underneath (conn2 ↔ VK relay). Same pattern as
 	// runDTLSSession: any TURN exit cancels the conn so the outer loop
 	// rebuilds it, and the relay leg is JOINED before this session returns —
 	// behind the credential's release above, so ahead of it, and ahead of every
 	// return below, the early ones too (relayjoin.go).
-	turnDone, _ := p.goRunTURN(connCtx, &leg, turnAddr, creds, conn2, connIdx, credSlot, connCancel)
+	turnDone, _ := p.goRunTURN(connCtx, &leg, turnAddr, creds, conn2, connIdx, credSlot, sessGen, connCancel)
 	defer p.joinRelayLeg(&leg, connCancel, connIdx)
 
-	// WRAP-A obfuscation around the DTLS-transport end of the pipe, then a
-	// plain DTLS client with amurcanov's exact config.
-	wrapAPC, err := newWrapAPacketConn(conn1, p.peer, p.wrapAKey)
-	if err != nil {
-		return fmt.Errorf("WRAP-A init: %w", err)
-	}
 	dtlsStart := time.Now()
 	dtlsConn, err := dialDTLSWrapA(connCtx, wrapAPC, p.peer)
 	if err != nil {
@@ -3222,7 +3352,7 @@ func (p *Proxy) runWrapASession(sessCtx context.Context, linkID string, readyCh 
 				// Mirror runDTLSSession's error attribution so quota / auth
 				// failures land on the slot that actually carried the cred.
 				if isQuotaError(turnErr) {
-					cooldown := p.credPool.markSaturated(credSlot, creds)
+					cooldown := p.credPool.markSaturated(credSlot, creds, turnAddr)
 					log.Printf("proxy: [conn %d] WRAP-A TURN allocate quota error (486) on slot %d (cooldown %s)",
 						connIdx, credSlot, cooldown.Round(time.Second))
 				} else if isAuthError(turnErr) {
@@ -3269,6 +3399,11 @@ func (p *Proxy) runWrapASession(sessCtx context.Context, linkID string, readyCh 
 	p.signalBootstrapDone(nil)
 
 	p.noteSessionUp(connIdx) // the retry floor's evidence that the network works — retryfloor.go
+	// The SERVER answered through this relay — DTLS and its GETCONF: the pool
+	// is told, as the DTLS family tells it from its handshake. This transport
+	// can SET the relay's peer mark (the refusal met inside the first write),
+	// so it is also the one to clear it (peerrefused.go).
+	p.relayCarriedPeer(sessCtx, connIdx, sessGen, turnAddr, attempt)
 	log.Printf("proxy: [conn %d, cred %d] WRAP-A+TURN session established (getconf ok)", connIdx, credSlot)
 
 	if connIdx >= 0 && connIdx < len(p.lastPongTimes) {
@@ -3494,7 +3629,8 @@ func addrFamilyFor(peer *net.UDPAddr) turn.RequestedAddressFamily {
 // Runs until the relay fails or ctx is cancelled. No forced lifetime —
 // the pion/turn client handles allocation refresh automatically.
 // conn2's deadline is reset before returning so it can be reused.
-func (p *Proxy) runTURN(ctx context.Context, turnAddr string, creds *TURNCreds, conn2 net.PacketConn, connIdx int, slotIdx int, gave *gaveBack) error {
+func (p *Proxy) runTURN(ctx context.Context, turnAddr string, creds *TURNCreds, conn2 net.PacketConn, connIdx int, slotIdx int, generation uint64, gave *gaveBack, ready chan<- struct{}) error {
+	attempt := time.Now() // when this relay attempt began — the relay health's window (relayhealth.go)
 	turnUDPAddr, err := resolvePhysicalUDP(ctx, turnAddr)
 	if err != nil {
 		return fmt.Errorf("resolve TURN: %w", err)
@@ -3505,7 +3641,7 @@ func (p *Proxy) runTURN(ctx context.Context, turnAddr string, creds *TURNCreds, 
 	if p.config.UseUDP {
 		udpConn, err := dialPhysical(ctx, "udp4", turnUDPAddr.String(), 5*time.Second)
 		if err != nil {
-			return fmt.Errorf("dial TURN UDP: %w", err)
+			return p.relayUnanswered(connIdx, slotIdx, creds, turnAddr, attempt, fmt.Errorf("dial TURN UDP: %w", err))
 		}
 		defer udpConn.Close()
 		turnConn = &connectedUDPConn{udpConn}
@@ -3514,13 +3650,10 @@ func (p *Proxy) runTURN(ctx context.Context, turnAddr string, creds *TURNCreds, 
 		defer tcpCancel()
 		tcpConn, err := dialPhysical(tcpCtx, "tcp4", turnAddr, 5*time.Second)
 		if err != nil {
-			return fmt.Errorf("dial TURN TCP: %w", err)
+			return p.relayUnanswered(connIdx, slotIdx, creds, turnAddr, attempt, fmt.Errorf("dial TURN TCP: %w", err))
 		}
 		defer tcpConn.Close()
-		// Registered AFTER the Close defer, so LIFO runs unregister FIRST and
-		// the sampler can never hold a socket that is being torn down.
 		p.sockStats.register(connIdx, tcpConn)
-		defer p.sockStats.unregister(connIdx)
 		turnConn = turn.NewSTUNConn(tcpConn)
 	}
 
@@ -3534,7 +3667,7 @@ func (p *Proxy) runTURN(ctx context.Context, turnAddr string, creds *TURNCreds, 
 		Username:               creds.Username,
 		Password:               creds.Password,
 		RequestedAddressFamily: addrFamily,
-		LoggerFactory:          &turnLoggerFactory{proxy: p, slot: slotIdx, life: gave.lifeOf()},
+		LoggerFactory:          &turnLoggerFactory{proxy: p, slot: slotIdx, ear: gave.lifeOf().newEar()},
 	}
 
 	client, err := turn.NewClient(cfg)
@@ -3553,7 +3686,7 @@ func (p *Proxy) runTURN(ctx context.Context, turnAddr string, creds *TURNCreds, 
 	gave.lifeOf().fresh()
 	relayConn, err := client.Allocate()
 	if err != nil {
-		return fmt.Errorf("TURN allocate: %w", err)
+		return p.relayUnanswered(connIdx, slotIdx, creds, turnAddr, attempt, fmt.Errorf("TURN allocate: %w", err))
 	}
 	gave.lifeOf().askMappingAtAllocate(client)
 	// The relay accepted this identity: mark it NOW, before anything
@@ -3563,7 +3696,7 @@ func (p *Proxy) runTURN(ctx context.Context, turnAddr string, creds *TURNCreds, 
 	// while the relay's answer was in flight, and a late success of the old
 	// credential must not certify the new one (quotabreaker.go; builds 391
 	// and 392, both caught on the user's control stand).
-	p.credPool.noteAllocated(slotIdx, creds)
+	p.relayAllocatedAt(slotIdx, creds, turnAddr, attempt)
 	if p.directMode() {
 		// The direct session has nothing above the relay: the allocation is the
 		// session coming up — the retry floor's evidence that the network works
@@ -3684,6 +3817,18 @@ func (p *Proxy) runTURN(ctx context.Context, turnAddr string, creds *TURNCreds, 
 		// Close: whichever of the two a late transaction meets, it ends.
 		client.Close()
 	})
+	quiesce := sync.OnceFunc(func() {
+		if !stopHook() {
+			<-hookDone
+		}
+	})
+	defer quiesce()
+	if ready != nil {
+		if err := client.CreatePermission(p.peer); err != nil {
+			return p.relayRefusedPeer(connIdx, turnAddr, attempt, fmt.Errorf("TURN create permission: %w", err))
+		}
+		close(ready)
+	}
 
 	var peerAddr atomic.Value
 
@@ -3771,6 +3916,11 @@ func (p *Proxy) runTURN(ctx context.Context, turnAddr string, creds *TURNCreds, 
 				out = wireBuf[:wn]
 			}
 			if _, err = relayConn.WriteTo(out, p.peer); err != nil {
+				// pion asks for the permission INSIDE the first write to the peer:
+				// a session that starts this leg without the explicit request
+				// above (WRAP-A, direct) meets the relay's refusal HERE, and the
+				// pool hears it from here (peerrefused.go).
+				_ = p.relayRefusedPeer(connIdx, turnAddr, attempt, err)
 				if ctx.Err() == nil {
 					log.Printf("proxy: [conn %d] runTURN conn2→relay: WriteTo error: %v (ctx=%v)", connIdx, err, ctx.Err())
 				}
@@ -3810,13 +3960,22 @@ func (p *Proxy) runTURN(ctx context.Context, turnAddr string, creds *TURNCreds, 
 		// Plaintext destination buffer for unwrap. Sized for the same
 		// 1600-byte upper bound conn2 expects to see.
 		plain := make([]byte, 1600)
+		carried := false // the pool has been told that this leg's relay carries the peer
 		for {
-			n, _, err := relayConn.ReadFrom(buf)
+			n, from, err := relayConn.ReadFrom(buf)
 			if err != nil {
 				if ctx.Err() == nil {
 					log.Printf("proxy: [conn %d] runTURN relay→conn2: ReadFrom error: %v (ctx=%v)", connIdx, err, ctx.Err())
 				}
 				return
+			}
+			// The direct session has nothing above the relay that could say the
+			// SERVER answered through it: the peer's first datagram on this leg
+			// is that word — once a leg, with the leg's own hand-out and start
+			// (peerrefused.go). The other transports say it from their handshake.
+			if !carried && p.directMode() && isFromPeer(from, p.peer) {
+				carried = true
+				p.relayCarriedPeer(ctx, connIdx, generation, turnAddr, attempt)
 			}
 			payload := buf[:n]
 			if useWrap {
@@ -3870,9 +4029,7 @@ func (p *Proxy) runTURN(ctx context.Context, turnAddr string, creds *TURNCreds, 
 	// for its lifetime (the user's review of 395). The hook is stopped, or
 	// waited for, before anything below touches a deadline.
 	turnCancel()
-	if !stopHook() {
-		<-hookDone
-	}
+	quiesce()
 	// Reset conn2 deadline so it can be reused by the next TURN session.
 	relayConn.SetDeadline(time.Time{})
 	conn2.SetDeadline(time.Time{})
@@ -4241,6 +4398,7 @@ func (p *Proxy) logMemStatsLoop(ctx context.Context) {
 	var prevForced bool
 
 	dump := func(label string) {
+		peerTimeouts, peerMarks := p.credPool.peerHandshakeStats()
 		var ms runtime.MemStats
 		runtime.ReadMemStats(&ms)
 		rssStr := "n/a"
@@ -4280,7 +4438,7 @@ func (p *Proxy) logMemStatsLoop(ctx context.Context) {
 		prevTxPkt = curTxPkt
 		prevRxPkt = curRxPkt
 
-		log.Printf("proxy: memstats %s rss=%s vm-internal=%s vm-external=%s vm-reusable=%s vm-compressed=%s sys=%s heap-alloc=%s heap-inuse=%s heap-idle=%s heap-released=%s stack=%s heap-objects=%d goroutines=%d numGC=%d tx-pkt=%d rx-pkt=%d rtpch-peak=%d sendch-peak=%d/%d sendch-block=%s/%d%s%s%s recvch-peak=%d/%d recvch-block=%s/%d%s%s",
+		log.Printf("proxy: memstats %s rss=%s vm-internal=%s vm-external=%s vm-reusable=%s vm-compressed=%s sys=%s heap-alloc=%s heap-inuse=%s heap-idle=%s heap-released=%s stack=%s heap-objects=%d goroutines=%d numGC=%d tx-pkt=%d rx-pkt=%d rtpch-peak=%d sendch-peak=%d/%d sendch-block=%s/%d%s%s%s recvch-peak=%d/%d recvch-block=%s/%d%s%s peer-hs-timeouts=%d peer-hs-marked=%d peer-hs-suspended=%d",
 			label,
 			rssStr,
 			internalStr,
@@ -4339,7 +4497,10 @@ func (p *Proxy) logMemStatsLoop(ctx context.Context) {
 			// that can see a packet waiting AFTER Write returned. 🚨 `sb`
 			// includes in-flight data by the SDK's own definition; read
 			// sockstats.go before quoting it.
-			p.sockStats.summary())
+			p.sockStats.summary(),
+			peerTimeouts,
+			peerMarks,
+			p.handshakeSuspended.Load())
 
 		// The downlink's own disorder, on its own line so it can be diffed
 		// field-for-field against server1's `reorder(uplink)` line — the two
@@ -4601,10 +4762,11 @@ func humanBytes(n int64) string {
 	return fmt.Sprintf("%.1f %cB", float64(n)/float64(div), "KMGT"[exp])
 }
 
-func dialDTLS(ctx context.Context, transport net.PacketConn, peer *net.UDPAddr) (net.Conn, error) {
+// dialDTLS establishes a legacy DTLS connection over the ready TURN leg.
+func (p *Proxy) dialDTLS(ctx context.Context, transport net.PacketConn) (net.Conn, error, handshakeObservation) {
 	certificate, err := selfsign.GenerateSelfSigned()
 	if err != nil {
-		return nil, err
+		return nil, err, handshakeObservation{}
 	}
 	// CipherSuites order is chosen to overlap with Apple WebRTC's ClientHello
 	// (captured via Wireshark on a real VK call): c02b, c02f, c00a, c014 are
@@ -4631,9 +4793,10 @@ func dialDTLS(ctx context.Context, transport net.PacketConn, peer *net.UDPAddr) 
 			dtls.TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA,      // 0xc014
 		},
 	}
-	dtlsConn, err := dtls.Client(transport, peer, config)
+	observed := &handshakePacketConn{PacketConn: transport}
+	dtlsConn, err := dtls.Client(observed, p.peer, config)
 	if err != nil {
-		return nil, err
+		return nil, err, handshakeObservation{}
 	}
 	// 15s timeout: shorter than the 30s default so the bootstrap retry
 	// loop (see startConnections) gets ~4 chances within ~90s instead of
@@ -4641,13 +4804,19 @@ func dialDTLS(ctx context.Context, transport net.PacketConn, peer *net.UDPAddr) 
 	// complete in ~50-300ms (see "DTLS HS" in stats), so 15s is plenty
 	// of headroom for slow networks while still failing fast on transient
 	// network breaks worth retrying.
-	hsCtx, hsCancel := context.WithTimeout(ctx, 15*time.Second)
-	defer hsCancel()
-	if err := dtlsConn.HandshakeContext(hsCtx); err != nil {
-		dtlsConn.Close()
-		return nil, err
+	timeout := p.dtlsHandshakeTimeout
+	if timeout == 0 {
+		timeout = 15 * time.Second
 	}
-	return dtlsConn, nil
+	return observePeerHandshake(ctx, timeout, p.snapshotPeerTraffic, func(hsCtx context.Context, noteSend func()) (net.Conn, error) {
+		observed.observer.Store(&noteSend)
+		defer observed.observer.Store(nil)
+		if err := dtlsConn.HandshakeContext(hsCtx); err != nil {
+			_ = dtlsConn.Close()
+			return nil, err
+		}
+		return dtlsConn, nil
+	})
 }
 
 type connectedUDPConn struct {
@@ -4675,27 +4844,29 @@ type turnLoggerFactory struct {
 	// runDirectSession path). Loggers inherit it so per-slot auth-error
 	// attribution works when pion logs a 401/403 — see turnLogger.maybeFlagAuthError.
 	slot int
-	// life is what the SESSION whose client this factory logs for keeps of its
+	// ear is where this factory's client is heard by the SESSION that keeps its
 	// allocation's life at the relay — pion's lines are the only place a
-	// refresh's outcome is heard (outofreach.go). nil = no bookkeeping.
-	life *allocLife
+	// refresh's outcome is heard — as THIS client's word and no other's: one ear
+	// a client, made for it (allocLife.newEar, outofreach.go). nil = no
+	// bookkeeping.
+	ear *lifeEar
 }
 
 func (f *turnLoggerFactory) NewLogger(scope string) logging.LeveledLogger {
-	return &turnLogger{scope: scope, proxy: f.proxy, slot: f.slot, life: f.life}
+	return &turnLogger{scope: scope, proxy: f.proxy, slot: f.slot, ear: f.ear}
 }
 
 type turnLogger struct {
 	scope string
 	proxy *Proxy
 	slot  int
-	life  *allocLife
+	ear   *lifeEar
 }
 
 func (l *turnLogger) Trace(msg string)                          {}
 func (l *turnLogger) Tracef(format string, args ...interface{}) {}
 func (l *turnLogger) Debug(msg string) {
-	l.life.heardDebug(msg)
+	l.ear.heardDebug(msg)
 	if strings.Contains(msg, "efresh") || strings.Contains(msg, "lifetime") || strings.Contains(msg, "Lifetime") ||
 		strings.Contains(msg, "Failed to read") || strings.Contains(msg, "Failed to handle") || strings.Contains(msg, "Exiting loop") {
 		log.Printf("pion/%s: %s", l.scope, msg)
@@ -4703,7 +4874,7 @@ func (l *turnLogger) Debug(msg string) {
 }
 func (l *turnLogger) Debugf(format string, args ...interface{}) {
 	msg := fmt.Sprintf(format, args...)
-	l.life.heardDebug(msg)
+	l.ear.heardDebug(msg)
 	if strings.Contains(msg, "efresh") || strings.Contains(msg, "lifetime") || strings.Contains(msg, "Lifetime") || strings.Contains(msg, "ifetime") ||
 		strings.Contains(msg, "Failed to read") || strings.Contains(msg, "Failed to handle") || strings.Contains(msg, "Exiting loop") {
 		log.Printf("pion/%s: %s", l.scope, msg)
@@ -4715,27 +4886,27 @@ func (l *turnLogger) Warn(msg string) {
 	log.Printf("pion/%s: WARN: %s", l.scope, sanitizeLog(msg))
 	l.maybeCountTransientError(msg)
 	l.maybeFlagAuthError(msg)
-	l.life.heardError(msg)
+	l.ear.heardError(msg)
 }
 func (l *turnLogger) Warnf(format string, args ...interface{}) {
 	msg := fmt.Sprintf(format, args...)
 	log.Printf("pion/%s: WARN: %s", l.scope, sanitizeLog(msg))
 	l.maybeCountTransientError(msg)
 	l.maybeFlagAuthError(msg)
-	l.life.heardError(msg)
+	l.ear.heardError(msg)
 }
 func (l *turnLogger) Error(msg string) {
 	log.Printf("pion/%s: ERROR: %s", l.scope, sanitizeLog(msg))
 	l.maybeCountTransientError(msg)
 	l.maybeFlagAuthError(msg)
-	l.life.heardError(msg)
+	l.ear.heardError(msg)
 }
 func (l *turnLogger) Errorf(format string, args ...interface{}) {
 	msg := fmt.Sprintf(format, args...)
 	log.Printf("pion/%s: ERROR: %s", l.scope, sanitizeLog(msg))
 	l.maybeCountTransientError(msg)
 	l.maybeFlagAuthError(msg)
-	l.life.heardError(msg)
+	l.ear.heardError(msg)
 }
 
 // maybeCountTransientError bumps the per-Proxy silent-degradation counter when
@@ -4833,6 +5004,9 @@ func isAuthError(err error) bool {
 	if err == nil {
 		return false
 	}
+	if isPeerRefused(err) {
+		return false // a 403 on the PERMISSION is the relay's policy about our peer, not a dead credential (peerrefused.go)
+	}
 	s := err.Error()
 	return strings.Contains(s, "error 401:") || strings.Contains(s, "error 403:")
 }
@@ -4899,6 +5073,34 @@ const groupHelloLen = 4 + 16
 // drops it as malformed (one 20-byte packet per session, nothing else). A
 // server that knows it reaps the old group at the next tick.
 var groupSupersedeMagic = []byte{0xff, 'S', 'U', 'P'}
+
+// groupPaceMagic opens the sentinel that DECLARES the pace of a connection's
+// relay to the server (2026-11-07, the user's design): 0xff 'P' 'A' 'C' + the
+// rate in KiB/s of counted bytes as two big-endian bytes (0 = no pacer; the
+// field's ceiling 65535), zero-padded to the hello's length — the hello's
+// construction, so a server that predates it forwards it to WireGuard, which
+// drops it (one 20-byte packet per session). A server that knows it paces
+// that connection's downlink at the declared rate in place of its
+// -downlink-pace (its own cap on top). Written right behind the hello and
+// the supersede sentinels, on a connection whose relay has the override
+// list's pace field (host:port:quota:pace); a relay without the field
+// declares nothing, the server's default stands. The client is the one party
+// that knows which relay a connection rides; the server sees an address.
+var groupPaceMagic = []byte{0xff, 'P', 'A', 'C'}
+
+// groupPaceBytes is the declaration for a pace of kib KiB/s.
+func groupPaceBytes(kib int) []byte {
+	if kib < 0 {
+		kib = 0
+	}
+	if kib > 0xffff {
+		kib = 0xffff
+	}
+	b := make([]byte, groupHelloLen)
+	copy(b, groupPaceMagic)
+	b[4], b[5] = byte(kib>>8), byte(kib)
+	return b
+}
 
 // groupGen is one generation of this tunnel's group: its hello, and whether a
 // session has ANNOUNCED it — written the hello to the server, which makes the
@@ -5068,7 +5270,7 @@ func (p *Proxy) groupHelloBytes() []byte {
 // optimisations, and a server that never sees them simply keeps the
 // connection on its own socket, or reaps at the backstop; a hello that never
 // left announces nothing.
-func (p *Proxy) sendGroupHello(w io.Writer) {
+func (p *Proxy) sendGroupHello(w io.Writer, connIdx int, gen uint64) {
 	g := p.groupHello.Load()
 	if g == nil {
 		return
@@ -5081,6 +5283,82 @@ func (p *Proxy) sendGroupHello(w io.Writer) {
 			return
 		}
 		p.noteSupersedeSent(s)
+	}
+	// The relay's pace, where its override entry has the field: declared
+	// behind the hello, so the server pairs it with the connection the hello
+	// just grouped (groupPaceMagic), and again behind every tick's ping
+	// (tickPing) — a lost copy heals by repetition.
+	p.sendPaceDeclaration(w, connIdx)
+	// And the connection this session replaces — its own index — so that the
+	// server ends the predecessor at once (groupReplaceMagic).
+	p.sendReplaceDeclaration(w, connIdx, gen)
+}
+
+// sendPaceDeclaration writes the declaration of connIdx's relay's pace, where
+// the relay has the field; nothing otherwise. Ignored on error like the hello
+// and the sentinels: the next tick writes it again, and a connection the
+// server never hears it from runs at the server's default.
+func (p *Proxy) sendPaceDeclaration(w io.Writer, connIdx int) {
+	if kib, ok := connRelayPace(connIdx); ok {
+		_, _ = w.Write(groupPaceBytes(kib))
+	}
+}
+
+// THE REPLACEMENT SENTINEL (2026-11-08, the failover run on 477 — Nov 8 §603):
+// a new session names the connection it REPLACES — its own index — behind the
+// hello and again behind every tick's ping, and the server ends the member that
+// held that index at once. Without it the server kept the forty dead members
+// of a black-holed relay until its zombie reaper (≈90 s), and its downlink hub
+// — one shared channel whose receivers are served longest-waiting first — fed
+// them the next ≈40 packets (WireGuard's handshake responses, the SYN-ACKs)
+// while the live sessions got nothing: ≈28 s of a deaf tunnel right after a
+// 1.5-s failover, the first download timed out. The hello's construction:
+// 0xff 'R' 'E' 'P' + the index (uint16) + the session's GENERATION (uint64),
+// big-endian, zero-padded to groupHelloLen; an old server forwards it to
+// WireGuard, which drops it; a repeat is a no-op there.
+//
+// THE GENERATION (the user's review of b1372eb): the index alone let the ORDER
+// of arrival decide who the successor was — the sentinel is repeated and
+// travels a UDP leg, so a late first copy of the old session, or a repeat it
+// had read before its end, could displace the healthy new session. The
+// generation is the session's hand-out stamp (the pool's counter at the
+// hand-out, recorded by recordHandOut — relaymarkend.go): fixed for one
+// session, higher for every later session on the index. The server keeps the
+// highest accepted per index and ignores anything at or below it.
+//
+// THE GENERATION IS THE SESSION's OWN (the user's review of af80e3c). The first
+// cut read it back from the connection table (connRelaySeq) at every send — and
+// Resume / ForceReconnect start new sessions without waiting for the old ones,
+// so an old session's tick declared the NEW hand-out's stamp, and the old
+// session's end cleared the row under the new one, which then declared 0 (a
+// real successor with generation 0 displaces nobody). Now the stamp of THIS
+// hand-out comes back from the pool with the address (handOut →
+// resolveTURNAddr) and the session hands it to its hello and its ticks; the
+// table row belongs to the session whose serial it holds (pathrestart.go).
+var groupReplaceMagic = []byte{0xff, 'R', 'E', 'P'}
+
+// groupReplaceBytes: the sentinel naming connIdx's session of generation gen;
+// nil for an index the wire cannot carry (negative — the probe's — or above
+// uint16).
+func groupReplaceBytes(connIdx int, gen uint64) []byte {
+	if connIdx < 0 || connIdx > 0xffff {
+		return nil
+	}
+	b := make([]byte, groupHelloLen)
+	copy(b, groupReplaceMagic)
+	binary.BigEndian.PutUint16(b[4:], uint16(connIdx))
+	binary.BigEndian.PutUint64(b[6:], gen)
+	return b
+}
+
+// sendReplaceDeclaration writes the replacement sentinel for connIdx's session
+// of generation gen — behind the hello (sendGroupHello) and behind every tick's
+// ping (tickPing). gen is the SESSION's, handed down from its hand-out
+// (resolveTURNAddr): never read back from the table here (the user's review
+// of af80e3c — see the block above).
+func (p *Proxy) sendReplaceDeclaration(w io.Writer, connIdx int, gen uint64) {
+	if b := groupReplaceBytes(connIdx, gen); b != nil {
+		_, _ = w.Write(b)
 	}
 }
 
@@ -5271,27 +5549,27 @@ func (p *Proxy) runSRTPSession(sessCtx context.Context, linkID string, readyCh c
 	defer connCancel()
 
 	// Acquire cred — same pattern as runDTLSSession / runDirectSession.
-	turnAddr, creds, credSlot, err := p.resolveTURNAddr(connIdx, false)
+	turnAddr, creds, credSlot, sessGen, err := p.resolveTURNAddr(sessCtx, connIdx, false)
 	if err != nil {
 		return err
 	}
 	// The lease is the pair (slot, credential) — see runDTLSSession.
-	currentSlot, currentCreds := credSlot, creds
+	currentSlot, currentCreds, currentAddr := credSlot, creds, turnAddr
 	// When this session's allocation is given back — by its live Close or by the
 	// abort of its setup — the lease is released behind the relay's second
 	// (seatcool.go).
 	var gave gaveBack
 	gave.watch(connCancel, connIdx, p.config.UseUDP) // a session dead at the relay is ended at once — outofreach.go
-	defer func() { p.releaseLease(currentSlot, currentCreds, &gave) }()
+	defer func() { p.releaseLease(currentSlot, currentCreds, currentAddr, &gave) }()
 
 	// Set up TURN allocation and DTLS-SRTP handshake to the peer.
 	sessStart := time.Now()
-	srtpConn, err := p.setupSRTPSession(connCtx, turnAddr, creds, credSlot, connIdx, &gave)
+	srtpConn, err := p.setupSRTPSession(connCtx, turnAddr, creds, credSlot, connIdx, &gave, sessGen)
 	if err != nil {
 		// Mirror runDTLSSession's error attribution so quota / auth
 		// failures land on the correct slot.
 		if isQuotaError(err) {
-			cooldown := p.credPool.markSaturated(credSlot, creds)
+			cooldown := p.credPool.markSaturated(credSlot, creds, turnAddr)
 			log.Printf("proxy: [conn %d] SRTP TURN allocate quota error (486) on slot %d (cooldown %s)",
 				connIdx, credSlot, cooldown.Round(time.Second))
 		} else if isAuthError(err) {
@@ -5302,9 +5580,6 @@ func (p *Proxy) runSRTPSession(sessCtx context.Context, linkID string, readyCh c
 		return fmt.Errorf("SRTP setup: %w", err)
 	}
 	defer srtpConn.Close()
-	// Paired with the register in setupSRTPSession, which cannot defer it: that
-	// function returns the connection and outlives its own frame.
-	defer p.sockStats.unregister(connIdx)
 	context.AfterFunc(connCtx, func() { _ = srtpConn.Close() })
 
 	p.dtlsHSns.Store(int64(time.Since(sessStart)))
@@ -5383,8 +5658,10 @@ func (p *Proxy) runSRTPSession(sessCtx context.Context, linkID string, readyCh c
 	// Mirrors the DTLS path's tick-gap freeze detector and wakeCh-driven
 	// active-probe-on-wake. Mostly verbatim from runDTLSSession; the
 	// only structural difference is writing through srtpConn instead of
-	// dtlsConn.
+	// dtlsConn. Joined by the session before it returns, as the DTLS one is.
+	pingDone := make(chan struct{})
 	go func() {
+		defer close(pingDone)
 		ticker := time.NewTicker(probeInterval)
 		defer ticker.Stop()
 		var seq uint64
@@ -5410,7 +5687,7 @@ func (p *Proxy) runSRTPSession(sessCtx context.Context, linkID string, readyCh c
 		// a probeInterval of that is a probeInterval of the old, skewed
 		// downlink at the start of every tunnel. Re-sent on every tick so a
 		// lost hello heals by repetition and a restarted server re-groups us.
-		p.sendGroupHello(srtpConn)
+		p.sendGroupHello(srtpConn, connIdx, sessGen)
 		lastTickAt := time.Now()
 		wake := p.newWakeWatch()
 		for {
@@ -5437,8 +5714,11 @@ func (p *Proxy) runSRTPSession(sessCtx context.Context, linkID string, readyCh c
 				lastTickAt = now
 				// The tick's ping is ONE body for both session kinds — seq and the stamp a
 				// wake probe may adopt it by move together there (tickPing, wakeprobe.go).
-				if err := p.tickPing(&seq, &lastPingAt, now, sendPing); err != nil {
-					return
+				if err := p.tickPing(&seq, &lastPingAt, now, sendPing, srtpConn, connIdx, sessGen); err != nil {
+					// The one verdict — see the DTLS session's tick (pingWriteFailed).
+					if p.pingWriteFailed(connCtx, connIdx, credSlot, "SRTP ", err, connCancel) {
+						return
+					}
 				}
 				if p.serverProbeable.Load() && connIdx >= 0 && connIdx < len(p.lastPongTimes) {
 					lastPong := time.Unix(p.lastPongTimes[connIdx].Load(), 0)
@@ -5468,7 +5748,11 @@ func (p *Proxy) runSRTPSession(sessCtx context.Context, linkID string, readyCh c
 				// both session kinds — wakeWatch.serve, wakeprobe.go (builds 422–424).
 				alive, probed, err := wake.serve(connCtx, connIdx, credSlot, "SRTP ", &seq, &lastPingAt, sendPing)
 				if err != nil {
-					return
+					// The one verdict — see the DTLS session's wake branch.
+					if p.pingWriteFailed(connCtx, connIdx, credSlot, "SRTP ", err, connCancel) {
+						return
+					}
+					continue
 				}
 				if !alive {
 					connCancel()
@@ -5482,6 +5766,8 @@ func (p *Proxy) runSRTPSession(sessCtx context.Context, linkID string, readyCh c
 			}
 		}
 	}()
+
+	defer p.joinPingLoop(connCancel, pingDone, connIdx, "SRTP ")
 
 	var wg sync.WaitGroup
 	wg.Add(2)
@@ -5639,7 +5925,8 @@ func (p *Proxy) runSRTPSession(sessCtx context.Context, linkID string, readyCh c
 // (srtpSessionConn wrapper) whose Read/Write framing is RTP+SRTP and
 // whose Close tears down the SRTP wrapper, the relay allocation, the
 // TURN client, and the underlying control conn together.
-func (p *Proxy) setupSRTPSession(ctx context.Context, turnAddr string, creds *TURNCreds, credSlot, connIdx int, gave *gaveBack) (net.Conn, error) {
+func (p *Proxy) setupSRTPSession(ctx context.Context, turnAddr string, creds *TURNCreds, credSlot, connIdx int, gave *gaveBack, generation uint64) (net.Conn, error) {
+	attempt := time.Now() // when this relay attempt began — the relay health's window (relayhealth.go)
 	// Local control conn: UDP socket (UDP-control) or TCP dial wrapped
 	// in turn.NewSTUNConn (TCP-control). Mirrors tools/turn_srtp_test
 	// transport plumbing.
@@ -5647,21 +5934,18 @@ func (p *Proxy) setupSRTPSession(ctx context.Context, turnAddr string, creds *TU
 	if p.config.UseUDP {
 		uc, err := dialPhysical(ctx, "udp4", turnAddr, 5*time.Second)
 		if err != nil {
-			return nil, fmt.Errorf("local udp listen: %w", err)
+			return nil, p.relayUnanswered(connIdx, credSlot, creds, turnAddr, attempt, fmt.Errorf("udp to relay: %w", err))
 		}
 		ctlConn = &connectedUDPConn{uc}
 	} else {
 		tcp, err := dialPhysical(ctx, "tcp4", turnAddr, 5*time.Second)
 		if err != nil {
-			return nil, fmt.Errorf("dial tcp to relay: %w", err)
+			return nil, p.relayUnanswered(connIdx, credSlot, creds, turnAddr, attempt, fmt.Errorf("dial tcp to relay: %w", err))
 		}
 		// 🚨 THE SECOND DIAL SITE, AND THE ONE THAT MATTERS. Build 233 registered
 		// only runTURN's socket and shipped: SRTP is the production transport and
 		// dials here, so `sock=` never appeared in a single line of the first
 		// device run. Instrument BOTH or neither.
-		//
-		// Unregistered where the session ends rather than by a defer: this
-		// function returns the conn and outlives its own frame.
 		p.sockStats.register(connIdx, tcp)
 		ctlConn = turn.NewSTUNConn(tcp)
 	}
@@ -5674,7 +5958,7 @@ func (p *Proxy) setupSRTPSession(ctx context.Context, turnAddr string, creds *TU
 		Realm:          "okcdn.ru",
 		Software:       "vk-turn-srtp",
 		// Custom factory (not pion's default LogLevelError) so SRTP-path TURN refresh/auth failures feed the silent-degradation watchdog + get sanitized, matching runTURN.
-		LoggerFactory: &turnLoggerFactory{proxy: p, slot: credSlot, life: gave.lifeOf()},
+		LoggerFactory: &turnLoggerFactory{proxy: p, slot: credSlot, ear: gave.lifeOf().newEar()},
 		// Match the relay family to the peer (see addrFamilyFor) — was
 		// hardcoded IPv4, which 443'd ("Peer Address Family Mismatch") on an
 		// IPv6 peer (e.g. a DNS name resolving to AAAA) — issue #39.
@@ -5696,14 +5980,14 @@ func (p *Proxy) setupSRTPSession(ctx context.Context, turnAddr string, creds *TU
 	if err != nil {
 		tc.Close()
 		_ = ctlConn.Close()
-		return nil, fmt.Errorf("turn allocate: %w", err)
+		return nil, p.relayUnanswered(connIdx, credSlot, creds, turnAddr, attempt, fmt.Errorf("turn allocate: %w", err))
 	}
 	gave.lifeOf().askMappingAtAllocate(tc) // how the relay sees this socket while the allocation is fresh — outofreach.go
 	// The relay accepted this identity: mark it NOW, before the permission
 	// and the SRTP handshake — the mark means the allocation, not the
 	// session, and names the credential, not the slot (quotabreaker.go; see
 	// runTURN).
-	p.credPool.noteAllocated(credSlot, creds)
+	p.relayAllocatedAt(credSlot, creds, turnAddr, attempt)
 	allocDur := time.Since(allocStart)
 	// Surface the TURN-allocate roundtrip to the UI / Stats endpoint
 	// — same field runDTLSSession populates at proxy.go:2706, so the
@@ -5766,14 +6050,24 @@ func (p *Proxy) setupSRTPSession(ctx context.Context, turnAddr string, creds *TU
 	}
 	if err := tc.CreatePermission(p.peer); err != nil {
 		abortSetup()
-		return nil, fmt.Errorf("turn create permission: %w", err)
+		return nil, p.relayRefusedPeer(connIdx, turnAddr, attempt, fmt.Errorf("turn create permission: %w", err))
 	}
 	log.Printf("proxy: [conn %d] TURN relay allocated: %s (RTT %dms, local=%s)",
 		connIdx, relayConn.LocalAddr(), allocDur.Milliseconds(), ctlConn.LocalAddr())
 
-	hsCtx, hsCancel := context.WithTimeout(ctx, srtpwrap.HandshakeTimeout)
-	srtpConn, err := srtpwrap.Client(hsCtx, relayConn, p.peer, &p.rtpChPeak)
-	hsCancel()
+	timeout := p.srtpHandshakeTimeout
+	if timeout == 0 {
+		timeout = srtpwrap.HandshakeTimeout
+	}
+	wakeEpoch := p.wakeEpoch.Load()
+	observed := &handshakePacketConn{PacketConn: relayConn}
+	srtpConn, err, observation := observePeerHandshake(ctx, timeout, p.snapshotPeerTraffic, func(hsCtx context.Context, noteSend func()) (net.Conn, error) {
+		observed.observer.Store(&noteSend)
+		defer observed.observer.Store(nil)
+		return srtpwrap.Client(hsCtx, observed, p.peer, &p.rtpChPeak)
+	})
+	observation.suspended = observation.suspended || p.wakeEpoch.Load() != wakeEpoch
+	p.notePeerHandshake(ctx, connIdx, generation, turnAddr, observation, err)
 	if err != nil {
 		abortSetup()
 		return nil, fmt.Errorf("srtp handshake: %w", err)
